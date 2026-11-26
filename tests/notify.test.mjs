@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { resolveCallback } from "../src/callback.mjs";
 import { Notifier, NotifyStore, resolveNotifySettings, eventIdFor } from "../src/notify.mjs";
 
 const SECRET = "test-secret-0123456789abcdef";
@@ -327,6 +328,9 @@ test("a revoked grant sends nothing and disables its preference row", async (t) 
 test("a private https target is refused before any body is sent", async (t) => {
   const dir = tempDir();
   const store = enabledStore(dir);
+  // Assert the refusal itself, not just its consequence: a connection to a
+  // private address fails the same way, so the rule has to be named here.
+  await assert.rejects(() => resolveCallback("https://10.0.0.1/hook"), /must not point at a private address/);
   // Default transport resolves and rejects private addresses (callback.mjs rules).
   const notifier = new Notifier({
     settings: resolveNotifySettings({ mode: "webhook", webhookUrl: "https://10.0.0.1/hook", secretFile: secretFile(dir) }, null),
