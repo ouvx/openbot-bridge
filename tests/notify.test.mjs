@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
-import { existsSync, mkdtempSync, writeFileSync, rmSync, mkdirSync, chmodSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -38,7 +38,7 @@ async function receiver({ tamper = false } = {}) {
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address();
-  return { server, seen, url: `http://127.0.0.1:${port}/hook`, close: () => new Promise((r) => server.close(r)) };
+  return { server, seen, url: `http://127.0.0.1:${port}/hook`, close: () => new Promise((r) => (server.listening ? server.close(() => r()) : r())) };
 }
 
 function settingsFor(url, dir) {
@@ -57,7 +57,7 @@ function enabledStore(dir, { grantId = "grant-1", clientId = "client-1", events 
   return store;
 }
 
-test("off: unset, session, unknown, bad url and bad secret send nothing and create no file", async () => {
+test("off: unset, session, unknown, bad url and bad secret send nothing and create no file", async (t) => {
   const cases = [
     { mode: "" },
     { mode: "session", webhookUrl: "https://example.test/hook" },
@@ -73,7 +73,7 @@ test("off: unset, session, unknown, bad url and bad secret send nothing and crea
     const notifier = new Notifier({ settings, logger: null, store: null, transport: async () => { calls += 1; return { status: 204 }; } });
     notifier.useDataDir(dir);
     const result = await notifier.notify("completed", { taskId: "t1", task: "demo", state: "completed", owner: { clientId: "c", grantId: "g" } });
-    assert.equal(result.sent, false);
+    assert.equal(result.attempted, false);
     assert.equal(calls, 0);
     assert.equal(existsSync(join(dir, "notify.db")), false, "off must not create the store");
     rmSync(dir, { recursive: true, force: true });
@@ -87,16 +87,17 @@ test("off: a secret file without 0600 refuses notifications", () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("prefs: both grant and client must be enabled, and the event bit must be set", async () => {
+test("prefs: both grant and client must be enabled, and the event bit must be set", async (t) => {
   const dir = tempDir();
   const rx = await receiver();
+  t.after(() => rx.close());
   const store = enabledStore(dir, { events: 1 }); // needs_approval only
   const notifier = new Notifier({ settings: settingsFor(rx.url, dir), logger: null, store, transport: null });
 
   const owner = { clientId: "client-1", grantId: "grant-1" };
   assert.equal((await notifier.notify("completed", { taskId: "a", task: "x", state: "completed", owner })).reason, "preference");
   assert.equal(rx.seen.length, 0);
-  assert.equal((await notifier.notify("needs_approval", { taskId: "b", task: "y", state: "needs_person", owner })).sent, true);
+  assert.equal((await notifier.notify("needs_approval", { taskId: "b", task: "y", state: "needs_person", owner })).attempted, true);
   assert.equal(rx.seen.length, 1);
   // another grant is not affected
   assert.equal((await notifier.notify("needs_approval", { taskId: "c", task: "z", state: "needs_person", owner: { clientId: "client-1", grantId: "grant-2" } })).reason, "preference");
@@ -107,14 +108,16 @@ test("prefs: both grant and client must be enabled, and the event bit must be se
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("signature: the receiver accepts a valid HMAC and rejects a tampered body", async () => {
+test("signature: the receiver accepts a valid HMAC and rejects a tampered body", async (t) => {
   const dir = tempDir();
   const ok = await receiver();
+  t.after(() => ok.close());
   const store = enabledStore(dir);
   const notifier = new Notifier({ settings: settingsFor(ok.url, dir), logger: null, store, transport: null });
   const owner = { clientId: "client-1", grantId: "grant-1" };
   const sent = await notifier.notify("completed", { taskId: "t1", task: "demo", state: "completed", owner });
-  assert.equal(sent.sent, true);
+  assert.equal(sent.attempted, true);
+  assert.equal(sent.delivered, true);
   assert.equal(sent.status, 204);
   assert.equal(ok.seen.length, 1);
   const first = ok.seen[0];
@@ -124,25 +127,28 @@ test("signature: the receiver accepts a valid HMAC and rejects a tampered body",
   // A receiver that expects a different HMAC returns 401; the bridge reports the failure.
   await ok.close();
   const bad = await receiver({ tamper: true });
+  t.after(() => bad.close());
   const notifier2 = new Notifier({ settings: settingsFor(bad.url, dir), logger: null, store, transport: null });
   const failed = await notifier2.notify("failed", { taskId: "t2", task: "demo2", state: "failed", owner });
-  assert.equal(failed.sent, true);
+  assert.equal(failed.attempted, true);
+  assert.equal(failed.delivered, false);
   assert.equal(failed.status, 401);
   store.close();
   await bad.close();
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("duplicate event ids are delivered once", async () => {
+test("duplicate event ids are delivered once", async (t) => {
   const dir = tempDir();
   const rx = await receiver();
+  t.after(() => rx.close());
   const store = enabledStore(dir);
   const notifier = new Notifier({ settings: settingsFor(rx.url, dir), logger: null, store, transport: null });
   const owner = { clientId: "client-1", grantId: "grant-1" };
   const first = await notifier.notify("completed", { taskId: "same", task: "x", state: "completed", owner });
   const second = await notifier.notify("completed", { taskId: "same", task: "x", state: "completed", owner });
-  assert.equal(first.sent, true);
-  assert.equal(second.sent, false);
+  assert.equal(first.attempted, true);
+  assert.equal(second.attempted, false);
   assert.equal(second.reason, "duplicate");
   assert.equal(rx.seen.length, 1);
   assert.equal(eventIdFor("grant-1", "same", "completed"), first.eventId);
@@ -151,28 +157,80 @@ test("duplicate event ids are delivered once", async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("rate limits suppress extra notifications per grant", async () => {
+test("rate limits suppress extra notifications per grant", async (t) => {
   const dir = tempDir();
   const rx = await receiver();
+  t.after(() => rx.close());
   const store = enabledStore(dir);
   const notifier = new Notifier({ settings: settingsFor(rx.url, dir), logger: null, store, transport: null, limits: { perGrantPerMinute: 2, globalPerMinute: 10 } });
   const owner = { clientId: "client-1", grantId: "grant-1" };
   const results = [];
   for (const id of ["a", "b", "c"]) results.push(await notifier.notify("completed", { taskId: id, task: id, state: "completed", owner }));
-  assert.deepEqual(results.map((r) => r.sent), [true, true, false]);
+  assert.deepEqual(results.map((r) => r.attempted), [true, true, false]);
   assert.equal(rx.seen.length, 2);
   store.close();
   await rx.close();
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("a revoked grant sends nothing and disables its preference row", async () => {
+test("a rate-suppressed event keeps its id and can be sent later", async (t) => {
   const dir = tempDir();
   const rx = await receiver();
+  t.after(() => rx.close());
+  const store = enabledStore(dir);
+  let clock = Date.parse("2026-01-01T00:00:00.000Z");
+  const notifier = new Notifier({ settings: settingsFor(rx.url, dir), logger: null, store, transport: null, now: () => clock, limits: { perGrantPerMinute: 1, globalPerMinute: 10 } });
+  const owner = { clientId: "client-1", grantId: "grant-1" };
+  assert.equal((await notifier.notify("completed", { taskId: "a", task: "a", state: "completed", owner })).attempted, true);
+  const suppressed = await notifier.notify("completed", { taskId: "b", task: "b", state: "completed", owner });
+  assert.equal(suppressed.attempted, false);
+  assert.equal(suppressed.reason, "rate");
+  clock += 61_000;
+  // The same event must not be burned by the earlier suppression.
+  const later = await notifier.notify("completed", { taskId: "b", task: "b", state: "completed", owner });
+  assert.equal(later.attempted, true);
+  assert.equal(later.delivered, true);
+  assert.equal(rx.seen.length, 2);
+  store.close();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("the payload carries a title only when one was given explicitly", async (t) => {
+  const dir = tempDir();
+  const rx = await receiver();
+  t.after(() => rx.close());
+  const store = enabledStore(dir);
+  const notifier = new Notifier({ settings: settingsFor(rx.url, dir), logger: null, store, transport: null });
+  const owner = { clientId: "client-1", grantId: "grant-1" };
+  await notifier.notify("completed", { taskId: "no-title", task: null, state: "completed", owner });
+  await notifier.notify("completed", { taskId: "with-title", task: "朝の確認", state: "completed", owner });
+  const bodies = rx.seen.map((entry) => JSON.parse(entry.body));
+  assert.equal("task" in bodies[0], false);
+  assert.equal(bodies[1].task, "朝の確認");
+  // No prompt text, arguments or paths leak into any payload field.
+  assert.deepEqual(Object.keys(bodies[0]).sort(), ["at", "eventId", "kind", "state"]);
+  store.close();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("a symlinked secret file is refused", () => {
+  const dir = tempDir();
+  const real = secretFile(dir);
+  const link = join(dir, "link.secret");
+  symlinkSync(real, link);
+  const settings = resolveNotifySettings({ mode: "webhook", webhookUrl: "https://example.test/hook", secretFile: link }, null);
+  assert.equal(settings.mode, "off");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("a revoked grant sends nothing and disables its preference row", async (t) => {
+  const dir = tempDir();
+  const rx = await receiver();
+  t.after(() => rx.close());
   const store = enabledStore(dir);
   const notifier = new Notifier({ settings: settingsFor(rx.url, dir), logger: null, store, transport: null, grantActive: () => false });
   const result = await notifier.notify("completed", { taskId: "x", task: "x", state: "completed", owner: { clientId: "client-1", grantId: "grant-1" } });
-  assert.equal(result.sent, false);
+  assert.equal(result.attempted, false);
   assert.equal(result.reason, "grant");
   assert.equal(rx.seen.length, 0);
   assert.equal(store.pref("grant-1", "client-1").enabled, false);
@@ -181,7 +239,7 @@ test("a revoked grant sends nothing and disables its preference row", async () =
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("a private https target is refused before any body is sent", async () => {
+test("a private https target is refused before any body is sent", async (t) => {
   const dir = tempDir();
   const store = enabledStore(dir);
   // Default transport resolves and rejects private addresses (callback.mjs rules).
@@ -192,15 +250,17 @@ test("a private https target is refused before any body is sent", async () => {
     transport: null,
   });
   const result = await notifier.notify("completed", { taskId: "x", task: "x", state: "completed", owner: { clientId: "client-1", grantId: "grant-1" } });
-  assert.equal(result.sent, false);
+  assert.equal(result.attempted, true);
+  assert.equal(result.delivered, false);
   assert.equal(result.reason, "transport");
   store.close();
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("the secret never appears in the payload, audit entries or log lines", async () => {
+test("the secret never appears in the payload, audit entries or log lines", async (t) => {
   const dir = tempDir();
   const rx = await receiver();
+  t.after(() => rx.close());
   const store = enabledStore(dir);
   const logged = [];
   const audited = [];
