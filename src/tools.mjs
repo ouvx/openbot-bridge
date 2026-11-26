@@ -771,6 +771,61 @@ export function registerTools(server, ctx) {
     }),
   );
 
+  // ------------------------------------------------------------- notifications ---
+  // Read-only views for "ask ChatGPT instead of push": the bridge cannot push
+  // into a conversation, so the user asks for this list in chat.
+
+  server.registerTool(
+    "get_pending",
+    {
+      title: "Pending approvals and questions",
+      description:
+        "List this connection's tasks that are waiting for a person inside OpenBot (an approval, a question, or a browser takeover). Read-only; it does not consume the write budget.",
+      inputSchema: {
+        limit: z.number().int().min(1).max(50).optional().describe("Maximum entries to return (default 10)."),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    },
+    withScope("openbot.read", "get_pending", async (args) => {
+      const limit = args?.limit ?? 10;
+      const waiting = jobs.list({ limit: 50, accepts: ownsJob }).filter((job) => job.status === "needs_person").slice(0, limit);
+      return reply({
+        pending: waiting.map((job) => ({
+          task_id: job.id,
+          title: job.title,
+          kind: job.kind,
+          status: job.status,
+          updated_at: job.updatedAt,
+        })),
+        count: waiting.length,
+      }, waiting.length ? `${waiting.length} task(s) need a person in OpenBot.` : "Nothing is waiting for a person.");
+    }),
+  );
+
+  server.registerTool(
+    "get_status",
+    {
+      title: "Recent task status",
+      description:
+        "Show this connection's running tasks and the most recent finished ones (completed or failed). Read-only; it does not consume the write budget.",
+      inputSchema: {
+        limit: z.number().int().min(1).max(50).optional().describe("Maximum finished entries to return (default 5)."),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    },
+    withScope("openbot.read", "get_status", async (args) => {
+      const limit = args?.limit ?? 5;
+      const all = jobs.list({ limit: 200, accepts: ownsJob });
+      const active = all.filter((job) => !ENDED_STATUSES.has(job.status) && job.status !== "needs_person");
+      const recent = all.filter((job) => ENDED_STATUSES.has(job.status)).slice(0, limit);
+      return reply({
+        running: active.map(jobSummary),
+        recent: recent.map(jobSummary),
+        running_count: active.length,
+      }, `${active.length} running, ${recent.length} recent.`);
+    }),
+  );
+
   return { resolveAgent, agentStatus };
 }
 
