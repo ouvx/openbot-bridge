@@ -35,6 +35,13 @@ export function loadConfig(env = process.env, overrides = {}) {
     extendedTools: env.BRIDGE_EXTENDED_TOOLS === "1",
     events: env.BRIDGE_EVENTS === "1" || env.BRIDGE_EVENTS === "true",
     approvalTtlSeconds: Number(env.BRIDGE_APPROVAL_TTL_SECONDS ?? 120),
+    notify: {
+      mode: env.BRIDGE_NOTIFY ?? "off",
+      webhookUrl: env.BRIDGE_NOTIFY_WEBHOOK_URL ?? "",
+      secretFile: env.BRIDGE_NOTIFY_SECRET_FILE ?? "",
+      allowLoopbackHttp: env.BRIDGE_NOTIFY_ALLOW_LOOPBACK_HTTP === "1",
+      timeoutMs: Number(env.BRIDGE_NOTIFY_TIMEOUT_MS ?? 3000),
+    },
     logLevel: env.BRIDGE_LOG_LEVEL || "info",
     sharedDir: env.OPENBOT_SHARED_DIR || join(home, "OpenBot", "Shared"),
     ...overrides,

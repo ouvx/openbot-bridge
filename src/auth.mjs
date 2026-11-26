@@ -299,6 +299,15 @@ export class OAuthServer {
     };
   }
 
+  /** 通知の失効判定: 同じ grant/client の有効な資格情報が 1 つでも残っているか。 */
+  grantActive(grantId, clientId) {
+    const now = Date.now();
+    const alive = entry => this.#bound(entry) && entry.expiresAt > now &&
+      entry.grantId === grantId && entry.clientId === clientId &&
+      Array.isArray(entry.scopes) && entry.scopes.includes("openbot.read");
+    return Object.values(this.#state.access).some(alive) || Object.values(this.#state.refresh).some(alive);
+  }
+
   grantAllowsAgent(grantId, clientId, agentId, scope) {
     if (typeof grantId !== "string" || !this.#agentsFor(clientId).includes(agentId)) return false;
     const permitted = entry => this.#bound(entry) && entry.expiresAt > Date.now() &&

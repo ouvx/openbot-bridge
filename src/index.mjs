@@ -11,6 +11,7 @@ import { OperationStore } from "./operations.mjs";
 import { JobStore } from "./jobs.mjs";
 import { OAuthError, OAuthServer, SCOPES } from "./auth.mjs";
 import { registerTools } from "./tools.mjs";
+import { createNotifier } from "./notify.mjs";
 import { DASHBOARD_MIME, DASHBOARD_URI, renderDashboard } from "./dashboard.mjs";
 import { EventBus, EventError } from "./events.mjs";
 
@@ -28,6 +29,7 @@ export async function startBridge(overrides = {}) {
 
   let oauth;
   let operations;
+  let notify = null;
   const eventsEnabled = config.events === true;
   const events = new EventBus({
     dataDir: config.dataDir, logger, jobs, db,
@@ -237,6 +239,9 @@ export async function startBridge(overrides = {}) {
       subjectLimit: config.limits.writesPerMinute, globalLimit: config.limits.globalWritesPerMinute,
     });
     oauth = server;
+    const notifier = createNotifier({ config, logger, audit, oauth });
+    jobs.setNotifier(notifier);
+    notify = notifier;
   } catch (error) {
     clearInterval(sweeper);
     await new Promise(resolve => httpServer.close(resolve));
@@ -258,6 +263,7 @@ export async function startBridge(overrides = {}) {
     automation,
     jobs,
     oauth,
+    notify,
     logger,
     sessions,
     operations,

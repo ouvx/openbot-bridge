@@ -32,7 +32,7 @@ export async function resolveCallback(url, resolve = lookup) {
 
 export class CallbackValidationError extends Error {}
 
-export async function postPinned(url, approved, headers, body, resolve = lookup, send = postToAddress) {
+export async function postPinned(url, approved, headers, body, resolve = lookup, send = postToAddress, timeoutMs = 10000) {
   let current;
   try {
     current = await resolveCallback(url, resolve);
@@ -43,17 +43,17 @@ export async function postPinned(url, approved, headers, body, resolve = lookup,
       current.some((address, index) => address !== approved[index])) {
     throw new CallbackValidationError("Callback address set changed.");
   }
-  return send(new URL(url), current[0], headers, body);
+  return send(new URL(url), current[0], headers, body, request, timeoutMs);
 }
 
-export function postToAddress(url, address, headers, body, connect = request) {
+export function postToAddress(url, address, headers, body, connect = request, timeoutMs = 10000) {
   return new Promise((resolve, reject) => {
     const req = connect({
       protocol: "https:", hostname: address, family: 4, port: url.port || 443,
       method: "POST", path: url.pathname + url.search, agent: false,
       servername: isIPv4(url.hostname) ? "" : url.hostname,
       headers: { ...headers, host: url.host, "content-length": Buffer.byteLength(body) },
-      rejectUnauthorized: true, signal: AbortSignal.timeout(10000),
+      rejectUnauthorized: true, signal: AbortSignal.timeout(timeoutMs),
     }, res => {
       const chunks = [];
       let size = 0;

@@ -19,12 +19,14 @@ export class JobStore {
   #logger;
   #db;
   #max = 2000;
+  #notify = null;
 
-  constructor({ dataDir, automation, logger, db }) {
+  constructor({ dataDir, automation, logger, db, notify = null }) {
     this.#dir = join(dataDir, "jobs");
     this.#automation = automation;
     this.#logger = logger;
     this.#db = db;
+    this.#notify = notify;
   }
 
   async init() {
@@ -47,6 +49,10 @@ export class JobStore {
     loaded.sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
     for (const job of loaded.slice(-this.#max)) this.#jobs.set(job.id, job);
     return this.#jobs.size;
+  }
+
+  setNotifier(notifier) {
+    this.#notify = notifier;
   }
 
   get size() {
@@ -142,6 +148,7 @@ export class JobStore {
     if (!job.deliveryId) return job;
     if (!force && job.lastPollAt && Date.now() - Date.parse(job.lastPollAt) < 1000) return job;
     job.lastPollAt = new Date().toISOString();
+    const previousStatus = job.status;
     try {
       const delivery = await this.#automation.delivery(job.agentId, job.deliveryId);
       if (delivery) {
@@ -179,7 +186,18 @@ export class JobStore {
         // The database is optional for progress; the automation API is authoritative.
       }
     }
-    return this.save(job);
+    const saved = await this.save(job);
+    if (job.status !== previousStatus) this.#emit(saved, job.status);
+    return saved;
+  }
+
+  #emit(job, status) {
+    if (!this.#notify) return;
+    const kind = status === "needs_person" ? "needs_approval" : status === "completed" ? "completed" : status === "failed" ? "failed" : null;
+    if (!kind) return;
+    const owner = { clientId: job.ownerClientId, grantId: job.ownerGrantId };
+    void this.#notify.notify(kind, { taskId: job.id, task: job.title ?? "task", state: status, owner })
+      .catch((error) => this.#logger?.warn("Notification hook failed", { error: String(error?.message ?? error) }));
   }
 
   /** Waits up to `seconds` for the job to end. Kept short to fit MCP timeouts. */
