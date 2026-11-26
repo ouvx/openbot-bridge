@@ -11,11 +11,15 @@ const USAGE = `Usage:
   node scripts/notify-prefs.mjs list [--dry-run]
   node scripts/notify-prefs.mjs enable --grant <id> --client <id> [--events needs_approval,completed,failed] [--dry-run]
   node scripts/notify-prefs.mjs disable --grant <id> --client <id> [--dry-run]
+  node scripts/notify-prefs.mjs include-task --grant <id> --client <id> --include-task on|off [--dry-run]
 
 Options:
-  --events   Comma list of needs_approval, completed, failed (default: all three)
-  --dry-run  Show what would change; write nothing
-  --db       Path to notify.db (default: <BRIDGE_DATA_DIR or ./data>/notify.db)
+  --events        Comma list of needs_approval, completed, failed (default: all three)
+  --include-task  on|off: send the task title the user typed (default: off)
+  --dry-run       Show what would change; write nothing
+  --db            Path to notify.db (default: <BRIDGE_DATA_DIR or ./data>/notify.db)
+
+The title is off by default because it can contain secrets or personal data.
 
 Enabling needs BRIDGE_NOTIFY=webhook and a valid webhook URL and secret file;
 while notifications are off the bridge ignores these rows.`;
@@ -24,13 +28,14 @@ const EVENT_NAMES = Object.keys(NOTIFY_EVENTS);
 const ALL_EVENTS = EVENT_NAMES.reduce((sum, name) => sum | NOTIFY_EVENTS[name], 0);
 
 function parseArgs(argv) {
-  const options = { command: null, dryRun: false, grant: null, client: null, events: null, db: null };
+  const options = { command: null, dryRun: false, grant: null, client: null, events: null, includeTask: undefined, db: null };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "--dry-run") options.dryRun = true;
     else if (arg === "--grant") options.grant = argv[++index] ?? "";
     else if (arg === "--client") options.client = argv[++index] ?? "";
     else if (arg === "--events") options.events = argv[++index] ?? "";
+    else if (arg === "--include-task") options.includeTask = argv[++index] ?? "";
     else if (arg === "--db") options.db = argv[++index] ?? "";
     else if (arg === "--help" || arg === "-h") return { help: true };
     else if (!options.command && !arg.startsWith("-")) options.command = arg;
@@ -51,6 +56,14 @@ function parseEvents(value) {
   }
   if (!mask) return { error: "At least one event is required." };
   return { mask };
+}
+
+function parseIncludeTask(value) {
+  if (value === undefined) return { value: false };
+  const text = String(value).trim().toLowerCase();
+  if (text === "on" || text === "1" || text === "true") return { value: true };
+  if (text === "off" || text === "0" || text === "false") return { value: false };
+  return { error: `--include-task takes on or off, not "${value}"` };
 }
 
 function describeEvents(mask) {
@@ -77,7 +90,7 @@ function main() {
   const options = parseArgs(process.argv.slice(2));
   if (options.help) { console.log(USAGE); return 0; }
   if (options.error) { console.error(options.error); console.error(USAGE); return 2; }
-  if (!["list", "enable", "disable"].includes(options.command)) {
+  if (!["list", "enable", "disable", "include-task"].includes(options.command)) {
     console.error(USAGE);
     return 2;
   }
@@ -92,7 +105,13 @@ function main() {
     if (options.command === "enable") {
       const parsed = parseEvents(options.events);
       if (parsed.error) { console.error(parsed.error); return 2; }
-      console.log(`Would enable notifications for grant=${options.grant} client=${options.client} events=${describeEvents(parsed.mask)}.`);
+      const include = parseIncludeTask(options.includeTask);
+      if (include.error) { console.error(include.error); return 2; }
+      console.log(`Would enable notifications for grant=${options.grant} client=${options.client} events=${describeEvents(parsed.mask)} include_task=${include.value ? "on" : "off"}.`);
+    } else if (options.command === "include-task") {
+      const include = parseIncludeTask(options.includeTask);
+      if (include.error) { console.error(include.error); return 2; }
+      console.log(`Would set include_task=${include.value ? "on" : "off"} for grant=${options.grant} client=${options.client}.`);
     } else {
       console.log(`Would disable notifications for grant=${options.grant} client=${options.client}.`);
     }
@@ -103,7 +122,7 @@ function main() {
     console.log(`No notification preferences in ${file} (the file does not exist yet).`);
     return 0;
   }
-  if (options.command === "disable" && !existsSync(file)) {
+  if (["disable", "include-task"].includes(options.command) && !existsSync(file)) {
     console.error(`No preference database at ${file}, so nothing is enabled for that grant.`);
     return 1;
   }
@@ -115,9 +134,19 @@ function main() {
       const rows = store.listPrefs();
       if (!rows.length) console.log(`No notification preferences in ${file}.`);
       for (const row of rows) {
-        console.log(`${row.enabled ? "enabled " : "disabled"}  grant=${row.grantId}  client=${row.clientId}  events=${describeEvents(row.events)}  updated=${row.updatedAt}`);
+        console.log(`${row.enabled ? "enabled " : "disabled"}  grant=${row.grantId}  client=${row.clientId}  events=${describeEvents(row.events)}  include_task=${row.includeTask ? "on" : "off"}  updated=${row.updatedAt}`);
       }
       return 0;
+    }
+
+    if (options.command === "include-task") {
+      const include = parseIncludeTask(options.includeTask);
+      if (include.error) { console.error(include.error); return 2; }
+      const changed = store.setIncludeTask(options.grant, options.client, include.value);
+      console.log(changed
+        ? `Set include_task=${include.value ? "on" : "off"} for grant=${options.grant} client=${options.client}.`
+        : `No preference row for grant=${options.grant} client=${options.client}; enable notifications first.`);
+      return changed ? 0 : 1;
     }
 
     if (options.command === "disable") {
@@ -130,8 +159,10 @@ function main() {
 
     const parsed = parseEvents(options.events);
     if (parsed.error) { console.error(parsed.error); return 2; }
-    store.setPref({ grantId: options.grant, clientId: options.client, enabled: true, events: parsed.mask });
-    console.log(`Enabled notifications for grant=${options.grant} client=${options.client} events=${describeEvents(parsed.mask)}.`);
+    const include = parseIncludeTask(options.includeTask);
+    if (include.error) { console.error(include.error); return 2; }
+    store.setPref({ grantId: options.grant, clientId: options.client, enabled: true, events: parsed.mask, includeTask: include.value });
+    console.log(`Enabled notifications for grant=${options.grant} client=${options.client} events=${describeEvents(parsed.mask)} include_task=${include.value ? "on" : "off"}.`);
     console.log("The bridge still needs BRIDGE_NOTIFY=webhook, a webhook URL and a 0600 secret file to send.");
     return 0;
   } finally {

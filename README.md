@@ -56,9 +56,11 @@ reads the secret file):
 node scripts/notify-prefs.mjs list
 node scripts/notify-prefs.mjs enable --grant <grantId> --client <clientId> --events needs_approval,completed
 node scripts/notify-prefs.mjs disable --grant <grantId> --client <clientId>
+node scripts/notify-prefs.mjs include-task --grant <grantId> --client <clientId> --include-task on
 ```
 
-Add `--dry-run` to see what would change. Revoking a grant disables its rows at once.
+Add `--dry-run` to see what would change. `--include-task` defaults to `off`; see the
+payload note below before turning it on. Revoking a grant disables its rows at once.
 These rows only take effect while the bridge itself has notifications enabled.
 
 **The bridge cannot push into a ChatGPT conversation.** If you want to be told inside
@@ -69,11 +71,14 @@ untested here.
 
 Payloads are limited to 512 bytes, signed with HMAC-SHA256
 (`X-Bridge-Signature`, `X-Bridge-Timestamp`, `X-Bridge-Event`), de-duplicated for 24 hours,
-and rate limited (20/min per grant, 100/min overall). A payload carries the event id,
-the kind, the task state and the time. A task title is included **only when the caller
-typed one** (the `title` argument); a title derived from the message, the task text or a
-previous task is left out, and no message text, arguments, artifacts, paths, agent
-identifiers, or secrets are included.
+and rate limited (20/min per grant, 100/min overall). By default a payload carries only
+the event id, the kind, the task state and the time: **no task name**. A task title can
+hold secrets or personal data, so it is sent only when the grant explicitly opts in with
+`notify-prefs.mjs include-task --include-task on`, and even then only a title the user
+typed (never one derived from the message, the task text or a previous task), cut to 200
+characters and still subject to the 512-byte limit — an over-long title is not sent at
+all. No message text, arguments, artifacts, paths, agent identifiers, or secrets are
+included in any case.
 
 One webhook destination serves every grant on this bridge: it does not multiplex
 per-tenant endpoints, so run one bridge per tenant.

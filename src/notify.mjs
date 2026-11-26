@@ -83,6 +83,7 @@ export class NotifyStore {
         client_id TEXT NOT NULL,
         enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
         events INTEGER NOT NULL,
+        include_task INTEGER NOT NULL DEFAULT 0,
         updated_at TEXT NOT NULL,
         PRIMARY KEY (grant_id, client_id)
       );
@@ -91,27 +92,40 @@ export class NotifyStore {
         at INTEGER NOT NULL
       );
     `);
+    // Databases written before include_task existed get the column here. The
+    // default 0 keeps every existing row on the no-title payload.
+    const columns = this.#db.prepare("PRAGMA table_info(notify_prefs)").all().map((row) => row.name);
+    if (!columns.includes("include_task")) {
+      this.#db.exec("ALTER TABLE notify_prefs ADD COLUMN include_task INTEGER NOT NULL DEFAULT 0");
+    }
   }
 
   static open(dataDir) {
     return new NotifyStore(join(dataDir, "notify.db"));
   }
 
-  setPref({ grantId, clientId, enabled, events }) {
+  setPref({ grantId, clientId, enabled, events, includeTask = false }) {
     this.#db.prepare(
-      `INSERT INTO notify_prefs (grant_id, client_id, enabled, events, updated_at) VALUES (?,?,?,?,?)
-       ON CONFLICT(grant_id, client_id) DO UPDATE SET enabled=excluded.enabled, events=excluded.events, updated_at=excluded.updated_at`,
-    ).run(grantId, clientId, enabled ? 1 : 0, events, new Date().toISOString());
+      `INSERT INTO notify_prefs (grant_id, client_id, enabled, events, include_task, updated_at) VALUES (?,?,?,?,?,?)
+       ON CONFLICT(grant_id, client_id) DO UPDATE SET enabled=excluded.enabled, events=excluded.events, include_task=excluded.include_task, updated_at=excluded.updated_at`,
+    ).run(grantId, clientId, enabled ? 1 : 0, events, includeTask ? 1 : 0, new Date().toISOString());
   }
 
   pref(grantId, clientId) {
-    const row = this.#db.prepare("SELECT enabled, events FROM notify_prefs WHERE grant_id = ? AND client_id = ?").get(grantId, clientId);
-    return row ? { enabled: row.enabled === 1, events: Number(row.events) } : null;
+    const row = this.#db.prepare("SELECT enabled, events, include_task FROM notify_prefs WHERE grant_id = ? AND client_id = ?").get(grantId, clientId);
+    return row ? { enabled: row.enabled === 1, events: Number(row.events), includeTask: Number(row.include_task) === 1 } : null;
   }
 
   listPrefs() {
-    return this.#db.prepare("SELECT grant_id, client_id, enabled, events, updated_at FROM notify_prefs ORDER BY grant_id, client_id").all()
-      .map((row) => ({ grantId: row.grant_id, clientId: row.client_id, enabled: row.enabled === 1, events: Number(row.events), updatedAt: row.updated_at }));
+    return this.#db.prepare("SELECT grant_id, client_id, enabled, events, include_task, updated_at FROM notify_prefs ORDER BY grant_id, client_id").all()
+      .map((row) => ({ grantId: row.grant_id, clientId: row.client_id, enabled: row.enabled === 1, events: Number(row.events), includeTask: Number(row.include_task) === 1, updatedAt: row.updated_at }));
+  }
+
+  /** Flip the title opt-in of an existing row; the event bits stay as they are. */
+  setIncludeTask(grantId, clientId, includeTask) {
+    const result = this.#db.prepare("UPDATE notify_prefs SET include_task = ?, updated_at = ? WHERE grant_id = ? AND client_id = ?")
+      .run(includeTask ? 1 : 0, new Date().toISOString(), grantId, clientId);
+    return Number(result.changes) > 0;
   }
 
   /** Enable or disable an existing row without touching its event bits. */
@@ -273,7 +287,11 @@ export class Notifier {
 
     const eventId = eventIdFor(owner.grantId, input.taskId ?? input.task, kind);
     const now = this.#now();
-    const task = typeof input.task === "string" && input.task.trim() ? input.task.trim().slice(0, 200) : null;
+    // A title can carry secrets or personal data, so it is off by default and
+    // only this grant's explicit include_task opt-in adds it (200 chars max).
+    const task = pref.includeTask && typeof input.task === "string" && input.task.trim()
+      ? input.task.trim().slice(0, 200)
+      : null;
     const payload = { eventId, kind, ...(task ? { task } : {}), state: String(input.state ?? "").slice(0, 40), at: new Date(now).toISOString() };
     const body = JSON.stringify(payload);
 

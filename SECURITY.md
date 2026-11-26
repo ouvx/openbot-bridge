@@ -72,8 +72,11 @@ OpenBot Bridge は OpenAI の承認・提携を受けていない非公式プロ
 - The secret file is opened once with `O_NOFOLLOW` and checked with `fstat` on that
   same descriptor: a symlink, a non-regular file, or a mode other than `0600` turns
   notifications off.
-- Payloads carry no task title unless the caller typed one; prompt-derived titles stay
-  in the local job record.
+- Payloads carry no task title by default. A grant may opt in with
+  `include_task` in `notify_prefs`; only then is a title the user typed sent (200
+  characters, inside the 512-byte budget), and a prompt-derived or bridge-generated
+  title always stays in the local job record. Titles never reach the audit trail or
+  the log.
 - A revoked grant disables its `notify_prefs` rows immediately; while notifications are
   off the bridge neither reads nor creates `notify.db`.
 - Audit lines record only the outcome, kind, event id and destination host.
