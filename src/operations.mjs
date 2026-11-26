@@ -101,6 +101,9 @@ export class OperationStore {
           tool TEXT, argsHash TEXT, issuedAt INTEGER, usedAt INTEGER, at INTEGER NOT NULL, outcome TEXT NOT NULL
         );
       `);
+      // カード発行は DB を正とする。既存ファイルにも列を足す（値は NULL = 未発行）。
+      const columns = this.#db.prepare("PRAGMA table_info(approvals)").all().map(column => column.name);
+      if (!columns.includes("cardOpenedAt")) this.#db.exec("ALTER TABLE approvals ADD COLUMN cardOpenedAt INTEGER");
     } catch (error) { this.#db.close(); throw error; }
   }
 
@@ -214,20 +217,66 @@ export class OperationStore {
     });
   }
 
-  card(approvalId) {
+  card(approvalId, openedAt = undefined) {
     const row = this.#row(approvalId);
     if (!row) deny("approval_unknown");
     if (row.expiresAt <= this.#now()) deny("approval_expired");
     if (row.state !== "pending") deny("approval_not_pending");
+    // 呼び出し元が発行世代を渡した場合だけ照合する（--replace で古い画面を無効化）。
+    if (openedAt !== undefined && (row.cardOpenedAt ?? null) !== openedAt) deny("approval_card_stale");
     if (hash(row.summary) !== row.summaryHash) deny("approval_card_mismatch");
     return { ...this.#prepared(row), tool: row.tool, targets: JSON.parse(row.targets), grantId: row.grantId, clientId: row.clientId,
       argsHash: row.argsHash, auditId: row.auditId, issuedAt: row.issuedAt };
   }
 
-  decide(approvalId, summaryHash, approved) {
+  /**
+   * カード発行の予約。DB の条件付き UPDATE で、同時に起動しても1枚しか勝たない。
+   * replace=true のときだけ既存の画面を失効させて新しい世代を発行する。
+   */
+  reserveCard(approvalId, { replace = false } = {}) {
+    return this.#transaction(() => {
+      const now = this.#now();
+      // 期限切れは状態にも反映する（監査と list で期限切れと分かるように）。
+      this.sweepExpired(now);
+      const row = this.#row(approvalId);
+      if (!row) deny("approval_unknown");
+      if (row.expiresAt <= now) deny("approval_expired");
+      if (row.state !== "pending") deny(row.state === "declined" ? "approval_declined" : "approval_not_pending");
+      if (hash(row.summary) !== row.summaryHash) deny("approval_card_mismatch");
+      if (row.cardOpenedAt === null || row.cardOpenedAt === undefined) {
+        const reserved = this.#db.prepare(`UPDATE approvals SET cardOpenedAt=?
+          WHERE approvalId=? AND cardOpenedAt IS NULL AND state='pending' AND expiresAt>?`).run(now, approvalId, now);
+        if (reserved.changes !== 1) deny("approval_card_open");
+        this.#audit(row, "card_opened");
+        return { approvalId, expiresAt: row.expiresAt, cardOpenedAt: now, replaced: false };
+      }
+      if (!replace) deny("approval_card_open");
+      // 直前の世代と一致するときだけ差し替える（同時 --replace でも1枚だけ勝つ）。
+      const replaced = this.#db.prepare("UPDATE approvals SET cardOpenedAt=? WHERE approvalId=? AND cardOpenedAt IS ?")
+        .run(now, approvalId, row.cardOpenedAt);
+      if (replaced.changes !== 1) deny("approval_card_open");
+      this.#audit(row, "card_replaced");
+      return { approvalId, expiresAt: row.expiresAt, cardOpenedAt: now, replaced: true, previousOpenedAt: row.cardOpenedAt };
+    });
+  }
+
+  /** 期限切れを状態に反映する（pending のまま残さない）。 */
+  sweepExpired(now = this.#now()) {
+    return this.#db.prepare("UPDATE approvals SET state='expired',summary=NULL WHERE state IN ('pending','approved') AND expiresAt<=?").run(now).changes;
+  }
+
+  /** CLI の案内用。例外を投げずに発行状態だけを返す。 */
+  cardState(approvalId) {
+    this.sweepExpired();
+    const row = this.#row(approvalId);
+    if (!row) return null;
+    return { approvalId: row.approvalId, state: row.state, expiresAt: row.expiresAt, cardOpenedAt: row.cardOpenedAt ?? null };
+  }
+
+  decide(approvalId, summaryHash, approved, openedAt = undefined) {
     try {
       return this.#transaction(() => {
-        const card = this.card(approvalId);
+        const card = this.card(approvalId, openedAt);
         if (card.summaryHash !== summaryHash) deny("approval_card_mismatch");
         if (typeof approved !== "boolean") deny("invalid_decision");
         const state = approved ? "approved" : "declined";
