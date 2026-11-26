@@ -69,5 +69,12 @@ OpenBot Bridge は OpenAI の承認・提携を受けていない非公式プロ
 - Delivery is fire-and-forget with a short timeout and no queue: a failed or refused
   delivery never fails the bridge request that triggered it, and nothing is retried
   after a restart.
+- The secret file is opened once with `O_NOFOLLOW` and checked with `fstat` on that
+  same descriptor: a symlink, a non-regular file, or a mode other than `0600` turns
+  notifications off.
+- Payloads carry no task title unless the caller typed one; prompt-derived titles stay
+  in the local job record.
+- A revoked grant disables its `notify_prefs` rows immediately; while notifications are
+  off the bridge neither reads nor creates `notify.db`.
 - Audit lines record only the outcome, kind, event id and destination host.
 

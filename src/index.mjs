@@ -241,6 +241,8 @@ export async function startBridge(overrides = {}) {
     oauth = server;
     const notifier = createNotifier({ config, logger, audit, oauth });
     jobs.setNotifier(notifier);
+    // A revoked grant turns its notification rows off immediately (no-op when off).
+    server.onRevoked = (grantId, clientId) => notifier.disableGrant(grantId, clientId);
     notify = notifier;
   } catch (error) {
     clearInterval(sweeper);

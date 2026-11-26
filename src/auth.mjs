@@ -49,6 +49,9 @@ function validateStore(state) {
 }
 
 export class OAuthServer {
+  /** Optional hook: (grantId, clientId) after a grant loses its last token. */
+  onRevoked = null;
+
   #file;
   #state = emptyState();
   #adminSecret;
@@ -325,6 +328,7 @@ export class OAuthServer {
     const clientId = one(params, "client_id");
     const presented = this.#state.access[key] ?? this.#state.refresh[key];
     if (!this.#bound(presented) || presented.clientId !== clientId) return;
+    const revoked = { grantId: presented.grantId, clientId };
     await this.#change(state => {
       const match = state.access[key] ?? state.refresh[key];
       if (!this.#bound(match) || match.clientId !== clientId) return;
@@ -334,6 +338,10 @@ export class OAuthServer {
         }
       }
     });
+    // Optional hook: notification preferences for a dead grant must not stay on.
+    if (!this.grantActive(revoked.grantId, revoked.clientId)) {
+      try { this.onRevoked?.(revoked.grantId, revoked.clientId); } catch { /* the grant is gone either way */ }
+    }
   }
 
   revokeAll() {
