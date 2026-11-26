@@ -124,9 +124,16 @@ test("scripts/notify-prefs.mjs lists, enables and disables rows without secrets"
   assert.equal(existsSync(dbFile), false, "dry-run must write nothing");
 
   const enabled = run("enable", "--grant", "grant-1", "--client", "client-1", "--events", "needs_approval,completed");
-  assert.match(enabled, /Enabled notifications for grant=grant-1 client=client-1 events=needs_approval,completed/);
+  assert.match(enabled, /Enabled notifications for grant=grant-1 client=client-1 events=needs_approval,completed include_task=off/);
   assert.equal(statSync(dbFile).mode & 0o777, 0o600);
-  assert.match(run("list"), /enabled +grant=grant-1 +client=client-1 +events=needs_approval,completed/);
+  assert.match(run("list"), /enabled +grant=grant-1 +client=client-1 +events=needs_approval,completed +include_task=off/);
+
+  // The title is an explicit opt-in and can be flipped on its own.
+  assert.match(run("include-task", "--grant", "grant-1", "--client", "client-1", "--include-task", "on"), /Set include_task=on/);
+  assert.match(run("list"), /include_task=on/);
+  assert.match(run("include-task", "--grant", "grant-1", "--client", "client-1", "--include-task", "off"), /Set include_task=off/);
+  assert.match(run("list"), /include_task=off/);
+  assert.throws(() => run("include-task", "--grant", "grant-1", "--client", "client-1", "--include-task", "yes"), /takes on or off/);
 
   const disabled = run("disable", "--grant", "grant-1", "--client", "client-1");
   assert.match(disabled, /Disabled notifications/);

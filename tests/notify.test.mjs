@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
+import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -51,9 +52,9 @@ function settingsFor(url, dir) {
   });
 }
 
-function enabledStore(dir, { grantId = "grant-1", clientId = "client-1", events = 7 } = {}) {
+function enabledStore(dir, { grantId = "grant-1", clientId = "client-1", events = 7, includeTask = false } = {}) {
   const store = NotifyStore.open(dir);
-  store.setPref({ grantId, clientId, enabled: true, events });
+  store.setPref({ grantId, clientId, enabled: true, events, includeTask });
   return store;
 }
 
@@ -195,7 +196,7 @@ test("a rate-suppressed event keeps its id and can be sent later", async (t) => 
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("the payload carries a title only when one was given explicitly", async (t) => {
+test("the payload carries no task title by default, even when one is given", async (t) => {
   const dir = tempDir();
   const rx = await receiver();
   t.after(() => rx.close());
@@ -204,13 +205,97 @@ test("the payload carries a title only when one was given explicitly", async (t)
   const owner = { clientId: "client-1", grantId: "grant-1" };
   await notifier.notify("completed", { taskId: "no-title", task: null, state: "completed", owner });
   await notifier.notify("completed", { taskId: "with-title", task: "朝の確認", state: "completed", owner });
+  await notifier.notify("failed", { taskId: "secret-title", task: "api_key=abc123 personal note", state: "failed", owner });
   const bodies = rx.seen.map((entry) => JSON.parse(entry.body));
-  assert.equal("task" in bodies[0], false);
-  assert.equal(bodies[1].task, "朝の確認");
-  // No prompt text, arguments or paths leak into any payload field.
-  assert.deepEqual(Object.keys(bodies[0]).sort(), ["at", "eventId", "kind", "state"]);
+  for (const body of bodies) {
+    assert.equal("task" in body, false);
+    assert.deepEqual(Object.keys(body).sort(), ["at", "eventId", "kind", "state"]);
+  }
+  assert.equal(JSON.stringify(bodies).includes("朝の確認"), false);
+  assert.equal(JSON.stringify(bodies).includes("api_key"), false);
   store.close();
   rmSync(dir, { recursive: true, force: true });
+});
+
+test("include_task=on adds the user's title, nothing else", async (t) => {
+  const dir = tempDir();
+  const rx = await receiver();
+  t.after(() => rx.close());
+  const store = enabledStore(dir, { includeTask: true });
+  const notifier = new Notifier({ settings: settingsFor(rx.url, dir), logger: null, store, transport: null });
+  const owner = { clientId: "client-1", grantId: "grant-1" };
+  await notifier.notify("completed", { taskId: "t1", task: "朝の確認", state: "completed", owner });
+  await notifier.notify("completed", { taskId: "t2", task: null, state: "completed", owner });
+  const bodies = rx.seen.map((entry) => JSON.parse(entry.body));
+  assert.equal(bodies[0].task, "朝の確認");
+  assert.equal("task" in bodies[1], false, "an empty title is still omitted");
+  store.close();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("include_task keeps the 200-character and 512-byte limits", async (t) => {
+  const dir = tempDir();
+  const rx = await receiver();
+  t.after(() => rx.close());
+  const store = enabledStore(dir, { includeTask: true });
+  const notifier = new Notifier({ settings: settingsFor(rx.url, dir), logger: null, store, transport: null });
+  const owner = { clientId: "client-1", grantId: "grant-1" };
+  const long = "a".repeat(300);
+  assert.equal((await notifier.notify("completed", { taskId: "long", task: long, state: "completed", owner })).attempted, true);
+  const body = JSON.parse(rx.seen[0].body);
+  assert.equal(body.task.length, 200);
+  assert.equal(Buffer.byteLength(rx.seen[0].body) <= 512, true);
+
+  // A multibyte title fits 200 characters but not the 512-byte budget, so it is
+  // refused instead of being cut further.
+  const fat = "𠮟".repeat(150);
+  const result = await notifier.notify("completed", { taskId: "fat", task: fat, state: "completed", owner });
+  assert.equal(result.attempted, false);
+  assert.equal(result.reason, "payload");
+  assert.equal(rx.seen.length, 1);
+  store.close();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("a title never reaches the audit trail or the log", async (t) => {
+  const dir = tempDir();
+  const rx = await receiver();
+  t.after(() => rx.close());
+  const store = enabledStore(dir, { includeTask: true });
+  const logged = [];
+  const audited = [];
+  const logger = { info: (...a) => logged.push(JSON.stringify(a)), warn: (...a) => logged.push(JSON.stringify(a)), error: (...a) => logged.push(JSON.stringify(a)), debug: (...a) => logged.push(JSON.stringify(a)) };
+  const notifier = new Notifier({ settings: settingsFor(rx.url, dir), logger, audit: (entry) => audited.push(JSON.stringify(entry)), store, transport: null });
+  await notifier.notify("completed", { taskId: "t1", task: "TITLE-MARKER-42", state: "completed", owner: { clientId: "client-1", grantId: "grant-1" } });
+  assert.equal(JSON.stringify(audited).includes("TITLE-MARKER-42"), false);
+  assert.equal(JSON.stringify(logged).includes("TITLE-MARKER-42"), false);
+  assert.equal(rx.seen[0].body.includes("TITLE-MARKER-42"), true, "the opt-in title does go to the configured receiver");
+  store.close();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("a database from before include_task is migrated with the opt-in off", async (t) => {
+  const dir = tempDir();
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const file = join(dir, "notify.db");
+  const legacy = new DatabaseSync(file);
+  legacy.exec(`CREATE TABLE notify_prefs (
+    grant_id TEXT NOT NULL, client_id TEXT NOT NULL,
+    enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
+    events INTEGER NOT NULL, updated_at TEXT NOT NULL,
+    PRIMARY KEY (grant_id, client_id));`);
+  legacy.prepare("INSERT INTO notify_prefs VALUES (?,?,?,?,?)").run("grant-1", "client-1", 1, 7, "2026-01-01T00:00:00.000Z");
+  legacy.close();
+
+  const store = new NotifyStore(file);
+  const prefs = store.pref("grant-1", "client-1");
+  assert.equal(prefs.enabled, true);
+  assert.equal(prefs.includeTask, false, "an old row must not start sending titles");
+  assert.equal(store.listPrefs()[0].includeTask, false);
+  assert.equal(store.setIncludeTask("grant-1", "client-1", true), true);
+  assert.equal(store.pref("grant-1", "client-1").includeTask, true);
+  assert.equal(store.setIncludeTask("grant-9", "client-9", true), false);
+  store.close();
 });
 
 test("a symlinked secret file is refused", () => {
