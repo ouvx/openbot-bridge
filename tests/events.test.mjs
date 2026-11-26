@@ -39,7 +39,7 @@ test("event subscriptions reject missing scope, unspecified or unauthorized agen
   await assert.rejects(bus.subscribe({ ...params, name: "unknown" }, auth), { reason: "unknown_event" });
 });
 
-test("TLS transport withholds the body from a peer that differs from the pinned IP", async () => {
+test("TLS transport withholds the body from a peer that differs from the pinned IP", async (t) => {
   let wrote = false;
   const req = new EventEmitter();
   req.end = () => { wrote = true; };
@@ -51,11 +51,28 @@ test("TLS transport withholds the body from a peer that differs from the pinned 
     assert.equal(options.rejectUnauthorized, true);
     return req;
   };
-  const result = postToAddress(new URL(target), "8.8.8.8", {}, "fixture", connect);
-  const socket = new EventEmitter();
-  socket.remoteAddress = "8.8.4.4";
-  req.emit("socket", socket);
-  socket.emit("secureConnect");
-  await assert.rejects(result, /differs from approved/);
-  assert.equal(wrote, false);
+  // The stand-in never emits a response, so this promise only settles through the
+  // peer check or the error path. If that check is removed the promise stays
+  // pending forever, which used to hang the whole run: bound the wait here and
+  // close the request in t.after, so the same change now fails this test fast.
+  const guardMs = 2000;
+  let timer;
+  const guard = new Promise((resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`the pinned-peer check did not run within ${guardMs}ms`)), guardMs);
+  });
+  t.after(() => {
+    clearTimeout(timer);
+    req.destroy(new Error("test cleanup"));
+  });
+  try {
+    const result = postToAddress(new URL(target), "8.8.8.8", {}, "fixture", connect);
+    const socket = new EventEmitter();
+    socket.remoteAddress = "8.8.4.4";
+    req.emit("socket", socket);
+    socket.emit("secureConnect");
+    await assert.rejects(Promise.race([result, guard]), /differs from approved/);
+    assert.equal(wrote, false);
+  } finally {
+    clearTimeout(timer);
+  }
 });
