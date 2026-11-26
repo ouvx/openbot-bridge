@@ -160,6 +160,7 @@ test("bridge: OAuth, tools, and task lifecycle against a fake OpenBot", async (t
     port,
     host: "127.0.0.1",
     publicUrl,
+    allowedOrigins: [publicUrl],
     adminSecret: fixtureSecret,
     dataDir: join(root, "data"),
     openbot: { dbPath, automationDir, configDir: root },
@@ -241,14 +242,14 @@ test("bridge: OAuth, tools, and task lifecycle against a fake OpenBot", async (t
   // A replayed code must fail.
   const replay = await fetch(`${publicUrl}/oauth/token`, {
     method: "POST",
-    body: new URLSearchParams({ grant_type: "authorization_code", code, code_verifier: verifier, client_id: registration.client_id }),
+    body: new URLSearchParams({ grant_type: "authorization_code", code, code_verifier: verifier, client_id: registration.client_id, resource: publicUrl, redirect_uri: redirectUri }),
   });
   assert.equal(replay.status, 400);
 
   // --- MCP session ---------------------------------------------------------
   const client = new Client({ name: "bridge-test", version: "0.0.0" });
   const transport = new StreamableHTTPClientTransport(new URL(`${publicUrl}/mcp`), {
-    requestInit: { headers: { authorization: `Bearer ${tokens.access_token}` } },
+    requestInit: { headers: { origin: publicUrl, authorization: `Bearer ${tokens.access_token}` } },
   });
   await client.connect(transport);
   t.after(async () => client.close());
@@ -309,6 +310,7 @@ test("bridge: read-only mode blocks writes", async (t) => {
     port,
     host: "127.0.0.1",
     publicUrl,
+    allowedOrigins: [publicUrl],
     adminSecret: fixtureSecret,
     dataDir: join(root, "data"),
     openbot: { dbPath, automationDir, configDir: root },
@@ -332,7 +334,7 @@ test("bridge: read-only mode blocks writes", async (t) => {
   }
   const tools = new Map();
   registerTools({ registerTool(name, info, fn) { tools.set(name, fn); } }, {
-    ...bridge, currentAuth: () => ({ ok: true, clientId: "test", scopes: ["openbot.read", "openbot.write"] }), audit: () => {},
+    ...bridge, currentAuth: () => ({ ok: true, clientId: "test", grantId: "fixture", allowedAgentIds: ["agent-1"], scopes: ["openbot.read", "openbot.write"] }), audit: () => {},
   });
   const denied = await tools.get("send_message")({ agent_id: "agent-1", message: "fixture" });
   assert.equal(denied.isError, true);

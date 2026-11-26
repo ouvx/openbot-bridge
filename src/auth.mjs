@@ -1,5 +1,5 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { readFile, rename, writeFile, mkdir } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 export const SCOPES = ["openbot.read", "openbot.write", "openbot.admin"];
@@ -7,32 +7,65 @@ export const SCOPES = ["openbot.read", "openbot.write", "openbot.admin"];
 const ACCESS_TTL_MS = 60 * 60 * 1000;
 const REFRESH_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const CODE_TTL_MS = 5 * 60 * 1000;
-
 const sha256 = (value) => createHash("sha256").update(value).digest("base64url");
 const token = (bytes = 32) => randomBytes(bytes).toString("base64url");
+const emptyState = () => ({ clients: {}, codes: {}, access: {}, refresh: {} });
+const isObject = value => value !== null && typeof value === "object" && !Array.isArray(value);
 
-/**
- * A small OAuth 2.1 authorization server that lives in the bridge process.
- *
- * ChatGPT cannot send API keys, so the MCP spec's OAuth flow is the only
- * supported way to authenticate a custom plugin: protected-resource metadata,
- * authorization-server metadata, dynamic client registration, authorization
- * code + PKCE, and short-lived bearer tokens. The consent page asks for the
- * admin passcode, so only someone with access to this machine can link ChatGPT.
- */
+function one(params, name) {
+  const values = params.getAll(name);
+  if (values.length !== 1 || !values[0]) throw new OAuthError("invalid_request", `Exactly one ${name} is required.`);
+  return values[0];
+}
+
+function validRedirect(value) {
+  if (typeof value !== "string" || !value || value.length > 2048 || /[\s\\#]/.test(value)) return false;
+  try {
+    const url = new URL(value);
+    if (url.username || url.password || !url.host || url.href !== value) return false;
+    return url.protocol === "https:" ||
+      (url.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname));
+  } catch {
+    return false;
+  }
+}
+
+function validStoredClient(id, client) {
+  return isObject(client) && client.client_id === id && Array.isArray(client.redirect_uris) && client.redirect_uris.length > 0;
+}
+
+function validateStore(state) {
+  if (!isObject(state) || !Object.keys(emptyState()).every(key => Object.hasOwn(state, key) && isObject(state[key]))) {
+    throw new Error("Invalid OAuth state structure.");
+  }
+  if (!Object.entries(state.clients).every(([id, client]) => validStoredClient(id, client))) {
+    throw new Error("Invalid OAuth client in state.");
+  }
+  for (const group of ["codes", "access", "refresh"]) {
+    if (!Object.values(state[group]).every(row => isObject(row) && Number.isFinite(row.expiresAt) && typeof row.clientId === "string")) {
+      throw new Error("Invalid OAuth credential in state.");
+    }
+  }
+}
+
 export class OAuthServer {
   #file;
-  #state = { clients: {}, codes: {}, access: {}, refresh: {} };
+  #state = emptyState();
   #adminSecret;
   #publicUrl;
   #logger;
+  #agents;
+  #clientAgents;
   #attempts = new Map();
+  #pending = Promise.resolve();
 
-  constructor({ dataDir, adminSecret, publicUrl, logger }) {
+  constructor({ dataDir, adminSecret, publicUrl, logger, allowedAgentIds = [], clientAgentIds = {} }) {
     this.#file = join(dataDir, "auth", "state.json");
     this.#adminSecret = adminSecret;
     this.#publicUrl = publicUrl;
     this.#logger = logger;
+    this.#agents = [...new Set(allowedAgentIds)];
+    this.#clientAgents = clientAgentIds;
   }
 
   get issuer() {
@@ -41,28 +74,48 @@ export class OAuthServer {
 
   async init() {
     await mkdir(dirname(this.#file), { recursive: true, mode: 0o700 });
+    let contents;
     try {
-      const loaded = JSON.parse(await readFile(this.#file, "utf8"));
-      this.#state = { clients: {}, codes: {}, access: {}, refresh: {}, ...loaded };
-    } catch {
-      // First start: an empty store is correct.
+      contents = await readFile(this.#file, "utf8");
+    } catch (error) {
+      if (error.code === "ENOENT") return;
+      throw error;
     }
-    this.#sweep();
+    const loaded = JSON.parse(contents);
+    validateStore(loaded);
+    this.#state = loaded;
   }
 
-  async #save() {
-    const tmp = `${this.#file}.tmp`;
-    await writeFile(tmp, JSON.stringify(this.#state, null, 2), { mode: 0o600 });
-    await rename(tmp, this.#file);
-  }
-
-  #sweep() {
-    const now = Date.now();
-    for (const group of ["codes", "access", "refresh"]) {
-      for (const [key, value] of Object.entries(this.#state[group])) {
-        if ((value.expiresAt ?? 0) < now) delete this.#state[group][key];
+  // One process owns this store. Publish the new in-memory state only after
+  // atomic replacement succeeds, so failed writes cannot consume a code.
+  #change(update) {
+    const run = this.#pending.then(async () => {
+      const draft = structuredClone(this.#state);
+      for (const group of ["codes", "access", "refresh"]) {
+        for (const [key, row] of Object.entries(draft[group])) {
+          if (row.expiresAt <= Date.now()) delete draft[group][key];
+        }
       }
-    }
+      const value = update(draft);
+      const tmp = this.#file + "." + token(16) + ".tmp";
+      try {
+        await writeFile(tmp, JSON.stringify(draft), { mode: 0o600, flag: "wx" });
+        await rename(tmp, this.#file);
+      } finally {
+        await rm(tmp, { force: true });
+      }
+      this.#state = draft;
+      return value;
+    });
+    this.#pending = run.catch(() => {});
+    return run;
+  }
+
+  #agentsFor(clientId) {
+    const map = this.#clientAgents;
+    if (Object.keys(map).length === 0) return this.#agents;
+    const assigned = Object.hasOwn(map, clientId) ? map[clientId] : [];
+    return this.#agents.filter(id => assigned.includes(id));
   }
 
   protectedResourceMetadata() {
@@ -81,6 +134,8 @@ export class OAuthServer {
       authorization_endpoint: `${this.#publicUrl}/oauth/authorize`,
       token_endpoint: `${this.#publicUrl}/oauth/token`,
       registration_endpoint: `${this.#publicUrl}/oauth/register`,
+      revocation_endpoint: `${this.#publicUrl}/oauth/revoke`,
+      revocation_endpoint_auth_methods_supported: ["none"],
       scopes_supported: SCOPES,
       response_types_supported: ["code"],
       grant_types_supported: ["authorization_code", "refresh_token"],
@@ -90,80 +145,66 @@ export class OAuthServer {
     };
   }
 
-  /** Dynamic client registration (public clients only, no client secret). */
   async register(input) {
-    const redirectUris = Array.isArray(input?.redirect_uris) ? input.redirect_uris.filter(isHttpsUrlOrLoopback) : [];
-    if (redirectUris.length === 0) throw new OAuthError("invalid_client_metadata", "redirect_uris is required");
+    const uris = input?.redirect_uris;
+    if (!Array.isArray(uris) || uris.length === 0 || uris.length > 16 || !uris.every(validRedirect)) {
+      throw new OAuthError("invalid_client_metadata", "Invalid redirect_uris.");
+    }
     const clientId = `client_${token(18)}`;
     const client = {
       client_id: clientId,
-      client_name: typeof input.client_name === "string" ? input.client_name.slice(0, 120) : "ChatGPT",
-      redirect_uris: redirectUris,
+      client_name: typeof input.client_name === "string" ? input.client_name.slice(0, 120) : "MCP client",
+      redirect_uris: [...uris],
       grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],
       token_endpoint_auth_method: "none",
       created_at: new Date().toISOString(),
     };
-    this.#state.clients[clientId] = client;
-    await this.#save();
-    this.#logger?.info("Registered an OAuth client", { clientId, clientName: client.client_name });
-    return {
-      ...client,
-      client_id_issued_at: Math.floor(Date.now() / 1000),
-    };
+    await this.#change(state => { state.clients[clientId] = client; });
+    this.#logger?.info("Registered an OAuth client", { clientId });
+    return { ...client, client_id_issued_at: Math.floor(Date.now() / 1000) };
   }
 
   client(clientId) {
-    return this.#state.clients[clientId] ?? null;
+    return Object.hasOwn(this.#state.clients, clientId) ? this.#state.clients[clientId] : null;
   }
 
-  /**
-   * Validates an authorization request and returns what the consent page needs.
-   * Throws OAuthError with a redirect-safe description when the request is wrong.
-   */
+  #resource(query) {
+    const resource = one(query, "resource");
+    if (resource !== this.#publicUrl) throw new OAuthError("invalid_target", "Resource does not match this bridge.");
+    return resource;
+  }
+
   authorizeRequest(query) {
-    const responseType = query.get("response_type");
-    if (responseType !== "code") throw new OAuthError("unsupported_response_type", "Only response_type=code is supported.");
-    const clientId = query.get("client_id");
-    const client = this.client(clientId ?? "");
-    if (!client) throw new OAuthError("invalid_client", "Unknown client_id.");
-    const redirectUri = query.get("redirect_uri") ?? client.redirect_uris[0];
-    if (!client.redirect_uris.includes(redirectUri)) throw new OAuthError("invalid_request", "redirect_uri is not registered.");
-    const challenge = query.get("code_challenge");
-    if (!challenge) throw new OAuthError("invalid_request", "PKCE code_challenge is required.");
-    if ((query.get("code_challenge_method") ?? "S256") !== "S256") {
-      throw new OAuthError("invalid_request", "Only S256 PKCE is supported.");
+    if (one(query, "response_type") !== "code") throw new OAuthError("unsupported_response_type", "Only code is supported.");
+    const clientId = one(query, "client_id");
+    const client = this.client(clientId);
+    if (!client) throw new OAuthError("invalid_client", "Unknown client.");
+    const redirectUri = one(query, "redirect_uri");
+    if (!validRedirect(redirectUri) || !client.redirect_uris.includes(redirectUri)) {
+      throw new OAuthError("invalid_request", "Invalid redirect_uri.");
     }
-    const requested = (query.get("scope") ?? "openbot.read").split(/\s+/).filter(Boolean);
-    const scopes = requested.filter((scope) => SCOPES.includes(scope));
-    if (scopes.length === 0) throw new OAuthError("invalid_scope", "No supported scope was requested.");
-    return {
-      client,
-      clientId,
-      redirectUri,
-      state: query.get("state") ?? "",
-      resource: query.get("resource") ?? this.#publicUrl,
-      codeChallenge: challenge,
-      scopes,
-    };
+    const challenge = one(query, "code_challenge");
+    if (one(query, "code_challenge_method") !== "S256" || !/^[A-Za-z0-9_-]{43}$/.test(challenge)) {
+      throw new OAuthError("invalid_request", "An S256 PKCE challenge is required.");
+    }
+    const resource = this.#resource(query);
+    const scopes = [...new Set((query.has("scope") ? one(query, "scope") : "openbot.read").split(/\s+/).filter(Boolean))];
+    if (!scopes.length || !scopes.every(scope => SCOPES.includes(scope))) throw new OAuthError("invalid_scope", "Invalid scope.");
+    return { client, clientId, redirectUri, state: query.get("state") ?? "", resource, codeChallenge: challenge, scopes };
   }
 
-  /** Step two of consent: the user typed the passcode on this machine. */
   async approve(request, passcode) {
-    if (!this.#allowedAttempt(request.clientId)) {
-      throw new OAuthError("temporarily_unavailable", "Too many passcode attempts. Wait a minute.");
-    }
-    if (!this.#passcodeMatches(passcode)) throw new OAuthError("access_denied", "The passcode is wrong.");
+    if (!this.#allowedAttempt(request.clientId)) throw new OAuthError("temporarily_unavailable", "Too many attempts.");
+    if (!this.#passcodeMatches(passcode)) throw new OAuthError("access_denied", "Invalid passcode.");
     const code = `code_${token(24)}`;
-    this.#state.codes[code] = {
-      clientId: request.clientId,
-      redirectUri: request.redirectUri,
-      codeChallenge: request.codeChallenge,
-      scopes: request.scopes,
-      resource: request.resource,
-      expiresAt: Date.now() + CODE_TTL_MS,
-    };
-    await this.#save();
+    await this.#change(state => {
+      state.codes[sha256(code)] = {
+        clientId: request.clientId, redirectUri: request.redirectUri, codeChallenge: request.codeChallenge,
+        scopes: request.scopes, resource: request.resource, expiresAt: Date.now() + CODE_TTL_MS,
+        grantId: token(24), allowedAgentIds: [...this.#agentsFor(request.clientId)],
+      };
+    });
     const url = new URL(request.redirectUri);
     url.searchParams.set("code", code);
     if (request.state) url.searchParams.set("state", request.state);
@@ -173,7 +214,7 @@ export class OAuthServer {
   #allowedAttempt(clientId) {
     const now = Date.now();
     const entry = this.#attempts.get(clientId) ?? { count: 0, resetAt: now + 60_000 };
-    if (now > entry.resetAt) {
+    if (now >= entry.resetAt) {
       entry.count = 0;
       entry.resetAt = now + 60_000;
     }
@@ -186,92 +227,104 @@ export class OAuthServer {
     if (typeof candidate !== "string") return false;
     const a = Buffer.from(candidate);
     const b = Buffer.from(this.#adminSecret);
-    if (a.length !== b.length) return false;
-    return timingSafeEqual(a, b);
+    return a.length === b.length && timingSafeEqual(a, b);
   }
 
-  /** Authorization-code or refresh-token exchange. */
+  #bound(entry) {
+    // Older records lack the consent-time agent set and grant identity.
+    return entry && typeof entry.grantId === "string" && entry.grantId.length > 0 &&
+      entry.resource === this.#publicUrl && validRedirect(entry.redirectUri) &&
+      Array.isArray(entry.allowedAgentIds) && entry.allowedAgentIds.every(id => typeof id === "string") &&
+      Array.isArray(entry.scopes) && entry.scopes.every(scope => SCOPES.includes(scope)) &&
+      this.client(entry.clientId)?.redirect_uris.includes(entry.redirectUri);
+  }
+
   async exchange(params) {
-    const grantType = params.get("grant_type");
-    if (grantType === "authorization_code") return this.#exchangeCode(params);
-    if (grantType === "refresh_token") return this.#exchangeRefresh(params);
-    throw new OAuthError("unsupported_grant_type", "Use authorization_code or refresh_token.");
-  }
-
-  async #exchangeCode(params) {
-    const code = params.get("code") ?? "";
-    const entry = this.#state.codes[code];
-    if (!entry || entry.expiresAt < Date.now()) throw new OAuthError("invalid_grant", "The code is unknown or expired.");
-    const clientId = params.get("client_id") ?? entry.clientId;
-    if (clientId !== entry.clientId) throw new OAuthError("invalid_grant", "The code belongs to another client.");
-    const verifier = params.get("code_verifier");
-    if (!verifier) throw new OAuthError("invalid_request", "code_verifier is required.");
-    if (sha256(verifier) !== entry.codeChallenge) throw new OAuthError("invalid_grant", "PKCE verification failed.");
-    if (params.get("redirect_uri") && params.get("redirect_uri") !== entry.redirectUri) {
-      throw new OAuthError("invalid_grant", "redirect_uri does not match the authorization request.");
+    const type = one(params, "grant_type");
+    if (type !== "authorization_code" && type !== "refresh_token") {
+      throw new OAuthError("unsupported_grant_type", "Unsupported grant.");
     }
-    delete this.#state.codes[code];
-    return this.#issue(entry.clientId, entry.scopes);
+    const resource = this.#resource(params);
+    const clientId = one(params, "client_id");
+    const redirectUri = one(params, "redirect_uri");
+    const isCode = type === "authorization_code";
+    const key = sha256(one(params, isCode ? "code" : "refresh_token"));
+    return this.#change(state => {
+      const group = isCode ? state.codes : state.refresh;
+      const entry = group[key];
+      if (!this.#bound(entry) || entry.resource !== resource || entry.clientId !== clientId || entry.redirectUri !== redirectUri) {
+        throw new OAuthError("invalid_grant", "Invalid grant or binding.");
+      }
+      if (isCode) {
+        const verifier = one(params, "code_verifier");
+        if (!/^[A-Za-z0-9._~-]{43,128}$/.test(verifier) || sha256(verifier) !== entry.codeChallenge) {
+          throw new OAuthError("invalid_grant", "PKCE verification failed.");
+        }
+      }
+      delete group[key];
+      return this.#issue(state, entry);
+    });
   }
 
-  async #exchangeRefresh(params) {
-    const refresh = params.get("refresh_token") ?? "";
-    const key = sha256(refresh);
-    const entry = this.#state.refresh[key];
-    if (!entry || entry.expiresAt < Date.now()) throw new OAuthError("invalid_grant", "The refresh token is unknown or expired.");
-    delete this.#state.refresh[key];
-    return this.#issue(entry.clientId, entry.scopes);
+  #issue(state, entry) {
+    const { clientId, redirectUri, grantId, resource, scopes, allowedAgentIds } = entry;
+    const binding = { clientId, redirectUri, grantId, resource, scopes, allowedAgentIds };
+    const access = `obr_${token()}`;
+    const refresh = `obf_${token()}`;
+    state.access[sha256(access)] = { ...binding, expiresAt: Date.now() + ACCESS_TTL_MS };
+    state.refresh[sha256(refresh)] = { ...binding, expiresAt: Date.now() + REFRESH_TTL_MS };
+    return { access_token: access, token_type: "Bearer", expires_in: ACCESS_TTL_MS / 1000, refresh_token: refresh, scope: scopes.join(" ") };
   }
 
-  async #issue(clientId, scopes) {
-    const access = `obr_${token(32)}`;
-    const refresh = `obf_${token(32)}`;
-    this.#state.access[sha256(access)] = {
-      clientId,
-      scopes,
-      expiresAt: Date.now() + ACCESS_TTL_MS,
-      createdAt: new Date().toISOString(),
-    };
-    this.#state.refresh[sha256(refresh)] = { clientId, scopes, expiresAt: Date.now() + REFRESH_TTL_MS };
-    await this.#save();
+  verify(header, expectedResource = this.#publicUrl) {
+    if (typeof header !== "string" || !header.startsWith("Bearer ")) return { ok: false, reason: "missing" };
+    const entry = this.#state.access[sha256(header.slice(7).trim())];
+    if (!this.#bound(entry) || entry.resource !== expectedResource) return { ok: false, reason: "invalid" };
+    if (entry.expiresAt <= Date.now()) return { ok: false, reason: "expired" };
     return {
-      access_token: access,
-      token_type: "Bearer",
-      expires_in: Math.floor(ACCESS_TTL_MS / 1000),
-      refresh_token: refresh,
-      scope: scopes.join(" "),
+      ok: true, clientId: entry.clientId, grantId: entry.grantId, scopes: [...entry.scopes],
+      allowedAgentIds: this.#agentsFor(entry.clientId).filter(id => entry.allowedAgentIds.includes(id)),
     };
   }
 
-  /** Bearer-token check used by every request to /mcp. */
-  verify(header) {
-    if (!header || !header.startsWith("Bearer ")) return { ok: false, reason: "missing" };
-    const hash = sha256(header.slice(7).trim());
-    const entry = this.#state.access[hash];
-    if (!entry) return { ok: false, reason: "invalid" };
-    if (entry.expiresAt < Date.now()) {
-      delete this.#state.access[hash];
-      return { ok: false, reason: "expired" };
-    }
-    return { ok: true, clientId: entry.clientId, scopes: entry.scopes };
+  grantAllowsAgent(grantId, clientId, agentId, scope) {
+    if (typeof grantId !== "string" || !this.#agentsFor(clientId).includes(agentId)) return false;
+    const permitted = entry => this.#bound(entry) && entry.expiresAt > Date.now() &&
+      entry.grantId === grantId && entry.clientId === clientId && entry.scopes.includes(scope) &&
+      entry.allowedAgentIds.includes(agentId);
+    return Object.values(this.#state.access).some(permitted) || Object.values(this.#state.refresh).some(permitted);
   }
 
   hasScope(auth, scope) {
     return Boolean(auth?.ok && Array.isArray(auth.scopes) && auth.scopes.includes(scope));
   }
 
-  async revokeAll() {
-    this.#state.access = {};
-    this.#state.refresh = {};
-    this.#state.codes = {};
-    await this.#save();
+  async revoke(params) {
+    const key = sha256(one(params, "token"));
+    const clientId = one(params, "client_id");
+    const presented = this.#state.access[key] ?? this.#state.refresh[key];
+    if (!this.#bound(presented) || presented.clientId !== clientId) return;
+    await this.#change(state => {
+      const match = state.access[key] ?? state.refresh[key];
+      if (!this.#bound(match) || match.clientId !== clientId) return;
+      for (const entries of [state.codes, state.access, state.refresh]) {
+        for (const [id, entry] of Object.entries(entries)) {
+          if (entry.grantId === match.grantId && entry.clientId === clientId) delete entries[id];
+        }
+      }
+    });
+  }
+
+  revokeAll() {
+    return this.#change(state => {
+      state.access = {};
+      state.refresh = {};
+      state.codes = {};
+    });
   }
 
   stats() {
-    return {
-      clients: Object.keys(this.#state.clients).length,
-      activeTokens: Object.keys(this.#state.access).length,
-    };
+    return { clients: Object.keys(this.#state.clients).length, activeTokens: Object.keys(this.#state.access).length };
   }
 }
 
@@ -280,15 +333,5 @@ export class OAuthError extends Error {
     super(description);
     this.code = code;
     this.status = code === "access_denied" ? 403 : 400;
-  }
-}
-
-function isHttpsUrlOrLoopback(value) {
-  try {
-    const url = new URL(value);
-    if (url.protocol === "https:") return true;
-    return url.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname);
-  } catch {
-    return false;
   }
 }

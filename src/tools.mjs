@@ -1,10 +1,8 @@
 import { z } from "zod";
-import { execFile } from "node:child_process";
-import { readFile, readdir, realpath, stat } from "node:fs/promises";
-import { basename, resolve, sep } from "node:path";
+import { readArtifact, listArtifacts } from "./artifacts.mjs";
 import { systemSnapshot } from "./openbot/system.mjs";
 import { isAgentAllowed } from "./config.mjs";
-import { isEnded } from "./jobs.mjs";
+import { isEnded, belongsToGrant } from "./jobs.mjs";
 import { maskSecrets, truncate } from "./log.mjs";
 
 const MAX_TEXT = 8000;
@@ -13,10 +11,8 @@ const ENDED_STATUSES = new Set(["completed", "failed", "interrupted", "cancelled
 /**
  * Registers every bridge tool on the MCP server.
  *
- * Reads come from OpenBot's projection database (read-only) and system files;
- * writes go through OpenBot's automation API. Nothing here runs a shell with
- * model-provided text: `git` is only ever called with fixed arguments inside an
- * agent's own workspace.
+ * Agent reads are scoped to the authenticated grant and local allowlist.
+ * Files must be present in a dedicated agent export directory.
  */
 export function registerTools(server, ctx) {
   const { config, db, automation, jobs, oauth, audit, logger } = ctx;
@@ -33,7 +29,7 @@ export function registerTools(server, ctx) {
   });
 
   const withScope = (scope, name, handler) => async (args, extra) => {
-    const auth = extra?.authInfo ?? ctx.currentAuth?.();
+    const auth = ctx.currentAuth?.();
     if (!oauth.hasScope(auth, scope)) {
       return fail(`This connection is missing the ${scope} scope. Reconnect the plugin in ChatGPT to grant it.`);
     }
@@ -55,8 +51,20 @@ export function registerTools(server, ctx) {
     }
   };
 
+  const agentAllowed = id => {
+    const auth = ctx.currentAuth?.();
+    return Boolean(auth?.ok && auth.clientId && auth.grantId && Array.isArray(auth.allowedAgentIds) &&
+      auth.allowedAgentIds.includes(id) && isAgentAllowed(config, id));
+  };
+  const ownsJob = job => job && agentAllowed(job.agentId) && belongsToGrant(job, ctx.currentAuth());
+  const ownedJob = id => {
+    const job = jobs.get(id);
+    if (!ownsJob(job)) throw new Error("Task unavailable.");
+    return job;
+  };
+
   const resolveAgent = (reference) => {
-    const agents = db.listAgents().filter(agent => isAgentAllowed(config, agent.id));
+    const agents = db.listAgents().filter(agent => agentAllowed(agent.id));
     if (!reference) throw new Error(`agent_id is required. Known agents: ${agents.map((a) => `${a.name} (${a.id})`).join(", ")}`);
     const byId = agents.find((agent) => agent.id === reference);
     if (byId) return byId;
@@ -70,7 +78,7 @@ export function registerTools(server, ctx) {
   };
 
   const requireAllowed = (agent) => {
-    if (!isAgentAllowed(config, agent.id)) throw new Error(`The bridge is not allowed to drive ${agent.name}.`);
+    if (!agentAllowed(agent.id)) throw new Error(`The bridge is not allowed to drive ${agent.name}.`);
     return agent;
   };
 
@@ -90,7 +98,7 @@ export function registerTools(server, ctx) {
     };
   };
 
-  const jobsForAgent = (agentId) => jobs.list({ agentId, limit: 5 });
+  const jobsForAgent = (agentId) => jobs.list({ agentId, limit: 5, accepts: ownsJob });
 
   // ---------------------------------------------------------------- reads ---
 
@@ -123,7 +131,7 @@ export function registerTools(server, ctx) {
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
     withScope("openbot.read", "list_agents", async () => {
-      const visible = db.listAgents().filter(agent => isAgentAllowed(config, agent.id)).map((agent) => {
+      const visible = db.listAgents().filter(agent => agentAllowed(agent.id)).map((agent) => {
         const status = agentStatus(agent);
         return {
           agent_id: agent.id,
@@ -155,7 +163,7 @@ export function registerTools(server, ctx) {
     {
       title: "Get one agent",
       description:
-        "Read one agent's role description, runtime, model, permission level, local skills, routines, current session and recent activity. Use it to explain what an agent can do or to pick the right agent for a task.",
+        "Read one agent's role description, runtime, model, permission level, routines, current session and recent activity. Use it to explain what an agent can do or to pick the right agent for a task.",
       inputSchema: {
         agent_id: z.string().describe("Agent id (or an exact agent name)."),
       },
@@ -165,7 +173,6 @@ export function registerTools(server, ctx) {
       const agent = resolveAgent(agent_id);
       const status = agentStatus(agent);
       const threads = db.listThreads(agent.id).slice(0, 5);
-      const skills = await listSkills(agent.workspacePath).catch(() => []);
       const structured = {
         agent: {
           agent_id: agent.id,
@@ -177,9 +184,7 @@ export function registerTools(server, ctx) {
           reasoning_effort: agent.reasoningEffort,
           access: agent.access,
           computer_use: agent.computerUse,
-          workspace_path: agent.workspacePath,
-          local_skills: skills,
-          allowed_by_bridge: isAgentAllowed(config, agent.id),
+          allowed_by_bridge: agentAllowed(agent.id),
           updated_at: agent.updatedAt,
         },
         status,
@@ -214,7 +219,7 @@ export function registerTools(server, ctx) {
       return reply(
         {
           agent_id: agent.id,
-          current_session_id: agent.threadId,
+          current_session_id: threads.some(thread => thread.threadId === agent.threadId) ? agent.threadId : null,
           sessions: threads.map((thread) => ({
             session_id: thread.threadId,
             title: thread.title,
@@ -246,7 +251,7 @@ export function registerTools(server, ctx) {
       const threadId = session_id ?? agent.threadId ?? db.listThreads(agent.id)[0]?.threadId;
       if (!threadId) return fail(`${agent.name} has no session yet.`);
       if (db.thread(threadId)?.agentId !== agent.id) return fail("Session unavailable for this agent.");
-      const messages = db.messages(threadId, { limit: limit ?? 30 });
+      const messages = db.messages(threadId, { agentId: agent.id, limit: limit ?? 30 });
       return reply(
         {
           agent_id: agent.id,
@@ -283,13 +288,12 @@ export function registerTools(server, ctx) {
     },
     withScope("openbot.read", "list_tasks", async ({ agent_id, status, limit }) => {
       const agent = agent_id ? resolveAgent(agent_id) : null;
-      let tasks = jobs.list({ agentId: agent?.id ?? null, limit: limit ?? 20 }).filter(job => isAgentAllowed(config, job.agentId));
-      if (status) tasks = tasks.filter((job) => job.status === status);
+      const tasks = jobs.list({ agentId: agent?.id ?? null, status, limit: limit ?? 20, accepts: ownsJob });
       const refreshed = await Promise.all(tasks.slice(0, 10).map((job) => jobs.refresh(job).catch(() => job)));
       const structured = {
         agent_id: agent?.id ?? null,
         tasks: refreshed.map((job) => ({ ...jobSummary(job), agent_id: job.agentId })),
-        recent_deliveries: agent ? db.deliveries(agent.id, limit ?? 10) : [],
+        recent_deliveries: agent ? db.deliveries(agent.id, limit ?? 10).filter(d => tasks.some(j => j.deliveryId === d.deliveryId)) : [],
       };
       return reply(
         structured,
@@ -312,11 +316,12 @@ export function registerTools(server, ctx) {
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
     withScope("openbot.read", "get_task", async ({ task_id, wait_seconds, include_answer }) => {
-      let job = jobs.get(task_id);
-      if (!job || !isAgentAllowed(config, job.agentId)) return fail("Task unavailable.");
+      let job = ownedJob(task_id);
       job = wait_seconds ? await jobs.waitFor(job, wait_seconds) : await jobs.refresh(job, { force: true });
       const agent = db.agent(job.agentId);
-      const logs = job.turnId ? db.activities({ turnId: job.turnId, limit: 30 }).reverse() : [];
+      const threadId = job.turnId && db.turn(job.turnId)?.threadId;
+      const logs = threadId && db.thread(threadId)?.agentId === job.agentId
+        ? db.activities({ agentId: job.agentId, turnId: job.turnId, threadId, limit: 30 }).reverse() : [];
       const structured = {
         ...jobSummary(job),
         agent_name: agent?.name ?? null,
@@ -356,10 +361,11 @@ export function registerTools(server, ctx) {
       let turnId = turn_id ?? null;
       let threadId = session_id ?? null;
       if (task_id) {
-        const job = jobs.get(task_id);
-        if (!job || !isAgentAllowed(config, job.agentId)) return fail("Task unavailable.");
-        turnId = turnId ?? job.turnId;
-        threadId = threadId ?? db.agent(job.agentId)?.threadId ?? null;
+        const job = ownedJob(task_id);
+        if (!job.turnId || (turnId && turnId !== job.turnId)) return fail("Turn unavailable.");
+        turnId = job.turnId;
+        const ownerThread = db.turn(turnId)?.threadId;
+        if (!ownerThread || db.thread(ownerThread)?.agentId !== job.agentId) return fail("Turn unavailable.");
       }
       if (!turnId && !threadId) return fail("Give task_id, turn_id or session_id.");
       if (turnId) {
@@ -367,8 +373,9 @@ export function registerTools(server, ctx) {
         if (!turnThread || (threadId && threadId !== turnThread)) return fail("Turn unavailable.");
         threadId = turnThread;
       }
-      if (!isAgentAllowed(config, db.thread(threadId)?.agentId)) return fail("Session unavailable.");
-      const activities = db.activities({ turnId, threadId, limit: limit ?? 80 }).reverse();
+      const agentId = db.thread(threadId)?.agentId;
+      if (!agentAllowed(agentId)) return fail("Session unavailable.");
+      const activities = db.activities({ agentId, turnId, threadId, limit: limit ?? 80 }).reverse();
       return reply(
         { turn_id: turnId, session_id: threadId, count: activities.length, activities },
         activities.map((entry) => `[${entry.createdAt}] ${entry.type} ${truncate(JSON.stringify(entry.payload ?? {}), 300)}`).join("\n") ||
@@ -382,7 +389,7 @@ export function registerTools(server, ctx) {
     {
       title: "List artifacts",
       description:
-        "List files an agent produced (OpenBot attachments) and, optionally, files in the agent's workspace. Use it to find reports, diffs, images or generated documents before fetching one with read_artifact.",
+        "List eligible text files in each permitted agent's export directory. Other workspace and attachment files are private.",
       inputSchema: {
         agent_id: z.string().optional(),
         include_workspace: z.boolean().optional(),
@@ -390,16 +397,16 @@ export function registerTools(server, ctx) {
       },
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
-    withScope("openbot.read", "list_artifacts", async ({ agent_id, include_workspace, limit }) => {
+    withScope("openbot.read", "list_artifacts", async ({ agent_id, limit }) => {
       const agent = agent_id ? resolveAgent(agent_id) : null;
-      const sources = agent ? [agent] : db.listAgents().filter(item => isAgentAllowed(config, item.id));
-      const attachments = sources.flatMap(item => db.attachments({ agentId: item.id, limit: limit ?? 30 })).slice(0, limit ?? 30);
-      const workspace = agent && include_workspace ? await listWorkspace(agent.workspacePath, 40).catch(() => []) : [];
-      return reply(
-        { agent_id: agent?.id ?? null, attachments, workspace_files: workspace },
-        [...attachments.map((item) => `${item.name} — ${item.size ?? "?"} bytes — ${item.path}`), ...workspace.map((item) => `workspace: ${item}`)].join("\n") ||
-          "No artifacts found.",
-      );
+      const sources = agent ? [agent] : db.listAgents().filter(item => agentAllowed(item.id));
+      const attachments = [];
+      const count = limit ?? 30;
+      for (const item of sources) {
+        if (attachments.length >= count) break;
+        attachments.push(...await listArtifacts(config.sharedDir, item.id, count - attachments.length, config.limits.artifactBytes));
+      }
+      return reply({ agent_id: agent?.id ?? null, attachments, workspace_files: [] });
     }),
   );
 
@@ -408,32 +415,20 @@ export function registerTools(server, ctx) {
     {
       title: "Read an artifact",
       description:
-        "Read the text of one artifact: either an attachment path from list_artifacts or a file inside an agent's workspace. Binary files and files above the size limit are refused. Only paths that resolve inside an allowed folder are readable.",
+        "Read an exported text artifact belonging to an agent permitted by this grant.",
       inputSchema: {
         agent_id: z.string().describe("Agent that owns the workspace."),
-        path: z.string().describe("Absolute or workspace-relative path."),
+        path: z.string().describe("Path inside the agent export directory."),
         max_bytes: z.number().int().min(1024).max(524288).optional(),
       },
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
     withScope("openbot.read", "read_artifact", async ({ agent_id, path, max_bytes }) => {
       const agent = resolveAgent(agent_id);
-      const roots = [agent.workspacePath, config.sharedDir].filter(Boolean);
-      const absolute = path.startsWith("/") ? path : resolve(agent.workspacePath ?? "/", path);
-      const real = await realpath(absolute).catch(() => null);
-      if (!real) return fail(`File not found: ${path}`);
-      const allowed = roots.some((root) => real === root || real.startsWith(root + sep));
-      if (!allowed) return fail("That path is outside the agent's workspace and the shared folder.");
-      const info = await stat(real);
-      if (!info.isFile()) return fail("That path is not a regular file.");
-      const limitBytes = max_bytes ?? config.limits.artifactBytes;
-      if (info.size > limitBytes) return fail(`The file is ${info.size} bytes; the limit is ${limitBytes}.`);
-      if (!isTextFile(real)) return fail("Only text files can be read through the bridge.");
-      const body = await readFile(real, "utf8");
-      return reply(
-        { path: real, name: basename(real), size: info.size, text: truncate(maskSecrets(body), config.limits.maxToolResultChars) },
-        truncate(maskSecrets(body), MAX_TEXT),
-      );
+      const limit = Math.min(max_bytes ?? config.limits.artifactBytes, config.limits.artifactBytes);
+      const file = await readArtifact(config.sharedDir, agent.id, path, limit);
+      const body = truncate(maskSecrets(file.text), config.limits.maxToolResultChars);
+      return reply({ ...file, text: body }, body);
     }),
   );
 
@@ -442,7 +437,7 @@ export function registerTools(server, ctx) {
     {
       title: "Get a workspace git diff",
       description:
-        "Run a read-only git status/diff inside an agent's workspace so you can review the code it changed. No other command can be run; arguments are fixed by the bridge.",
+        "Workspace Git access is disabled. An agent can export a reviewed patch for read_artifact.",
       inputSchema: {
         agent_id: z.string().describe("Agent whose workspace is inspected."),
         mode: z.enum(["status", "diff", "stat"]).optional(),
@@ -450,12 +445,9 @@ export function registerTools(server, ctx) {
       },
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
-    withScope("openbot.read", "get_git_diff", async ({ agent_id, mode, max_bytes }) => {
-      const agent = resolveAgent(agent_id);
-      if (!agent.workspacePath) return fail(`${agent.name} has no workspace folder.`);
-      const args = mode === "status" ? ["-C", agent.workspacePath, "status", "--short", "--branch"] : mode === "stat" ? ["-C", agent.workspacePath, "diff", "--stat"] : ["-C", agent.workspacePath, "diff", "--no-color"];
-      const output = await runGit(args, max_bytes ?? config.limits.artifactBytes);
-      return reply({ agent_id: agent.id, workspace: agent.workspacePath, mode: mode ?? "diff", diff: output }, output || "No changes.");
+    withScope("openbot.read", "get_git_diff", async ({ agent_id }) => {
+      resolveAgent(agent_id);
+      return fail("Workspace diffs are private. Read a published diff from the agent export directory.");
     }),
   );
 
@@ -509,11 +501,11 @@ export function registerTools(server, ctx) {
 
   const dispatch = async ({ agentId, kind, title, prompt, idempotencyKey }) => {
     if (idempotencyKey) {
-      const existing = jobs.findByIdempotencyKey(idempotencyKey);
+      const existing = jobs.findByIdempotencyKey(idempotencyKey, ctx.currentAuth());
       if (existing && existing.agentId !== agentId) throw new Error("That idempotency key cannot be reused for a different target.");
       if (existing) return existing;
     }
-    const job = await jobs.create({ agentId, kind, title, prompt, idempotencyKey });
+    const job = await jobs.create({ agentId, kind, title, prompt, idempotencyKey, owner: ctx.currentAuth() });
     try {
       return await jobs.dispatch(job);
     } catch (error) {
@@ -618,8 +610,7 @@ export function registerTools(server, ctx) {
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
     withScope("openbot.write", "send_feedback", async ({ task_id, feedback, wait_seconds }) => {
-      const original = jobs.get(task_id);
-      if (!original) return fail(`No task ${task_id}.`);
+      const original = ownedJob(task_id);
       const agent = requireAllowed(db.agent(original.agentId) ?? { id: original.agentId, name: original.agentId });
       const prompt = [
         `【前の作業への修正指示】対象: ${original.title} (${original.id})`,
@@ -651,8 +642,7 @@ export function registerTools(server, ctx) {
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
     },
     withScope("openbot.write", "cancel_task", async ({ task_id, reason }) => {
-      const job = jobs.get(task_id);
-      if (!job) return fail(`No task ${task_id}.`);
+      const job = ownedJob(task_id);
       requireAllowed({ id: job.agentId, name: "this target" });
       const updated = await jobs.cancel(job, reason ?? "Cancelled from ChatGPT.");
       return reply(
@@ -698,7 +688,7 @@ export function registerTools(server, ctx) {
     },
     withScope("openbot.read", "openbot_dashboard", async ({ agent_id }) => {
       const focus = agent_id ? resolveAgent(agent_id) : null;
-      const agents = db.listAgents().filter(agent => isAgentAllowed(config, agent.id)).map((agent) => ({
+      const agents = db.listAgents().filter(agent => agentAllowed(agent.id)).map((agent) => ({
         agent_id: agent.id,
         name: agent.name,
         provider: agent.provider,
@@ -706,7 +696,7 @@ export function registerTools(server, ctx) {
         status: agentStatus(agent).status,
         focus: focus?.id === agent.id,
       }));
-      const tasks = jobs.list({ agentId: focus?.id ?? null, limit: 8 }).filter(job => isAgentAllowed(config, job.agentId)).map(jobSummary);
+      const tasks = jobs.list({ agentId: focus?.id ?? null, limit: 8, accepts: ownsJob }).map(jobSummary);
       const snapshot = await systemSnapshot();
       const payload = {
         updated_at: new Date().toISOString(),
@@ -747,48 +737,4 @@ function jobSummary(job) {
     ended: ENDED_STATUSES.has(job.status),
     needs_person: job.status === "needs_person",
   };
-}
-
-async function listSkills(workspacePath) {
-  if (!workspacePath) return [];
-  const roots = [`${workspacePath}/.agents/skills`, `${workspacePath}/.claude/skills`];
-  const found = new Set();
-  for (const root of roots) {
-    try {
-      for (const entry of await readdir(root)) found.add(entry);
-    } catch {
-      // No skills folder.
-    }
-  }
-  return [...found].slice(0, 40);
-}
-
-async function listWorkspace(workspacePath, limit) {
-  if (!workspacePath) return [];
-  const entries = await readdir(workspacePath);
-  return entries.filter((entry) => !entry.startsWith(".")).slice(0, limit);
-}
-
-function isTextFile(path) {
-  const textExtensions = new Set([
-    "md", "txt", "json", "yaml", "yml", "js", "mjs", "cjs", "ts", "tsx", "jsx", "py", "rb", "go", "rs", "java", "kt",
-    "c", "h", "cpp", "hpp", "cs", "php", "sh", "bash", "zsh", "sql", "html", "css", "scss", "svg", "xml", "toml",
-    "ini", "cfg", "conf", "log", "csv", "tsv", "diff", "patch", "env", "lock", "gitignore", "dockerfile", "makefile",
-  ]);
-  const name = basename(path).toLowerCase();
-  if (name === "dockerfile" || name === "makefile") return true;
-  const extension = name.includes(".") ? name.split(".").pop() : "";
-  return textExtensions.has(extension);
-}
-
-function runGit(args, maxBytes) {
-  return new Promise((resolvePromise, reject) => {
-    execFile("git", args, { timeout: 15000, maxBuffer: maxBytes, encoding: "utf8" }, (error, stdout) => {
-      if (error && !stdout) {
-        reject(new Error(`git could not read that workspace: ${error.message}`));
-        return;
-      }
-      resolvePromise(truncate(maskSecrets(stdout), maxBytes));
-    });
-  });
 }

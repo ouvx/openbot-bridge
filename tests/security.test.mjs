@@ -37,14 +37,15 @@ test("private callbacks are refused", async () => {
 });
 
 test("event subscribe refuses bad input before touching the network", async () => {
+  const auth = { ok: true, clientId: "c", grantId: "g", scopes: ["openbot.read"], allowedAgentIds: ["a"] };
   const bus = new EventBus({ dataDir: "/tmp/openbot-bridge-unused", logger: { info() {}, warn() {} }, jobs: { list: () => [] }, db: {} });
-  await assert.rejects(() => bus.subscribe({ name: "nope", delivery: { mode: "webhook", url: "https://example.com", secret: "whsec_x" } }, "c"), /does not offer/);
+  await assert.rejects(() => bus.subscribe({ name: "nope", delivery: { mode: "webhook", url: "https://example.com", secret: "whsec_x" } }, auth), /does not offer/);
   await assert.rejects(
-    () => bus.subscribe({ name: "task.status_changed", delivery: { mode: "webhook", url: "http://example.com", secret: `whsec_${"a".repeat(32)}` } }, "c"),
+    () => bus.subscribe({ name: "task.status_changed", arguments: { agent_id: "a" }, delivery: { mode: "webhook", url: "http://example.com", secret: `whsec_${"a".repeat(32)}` } }, auth),
     /HTTPS/,
   );
   await assert.rejects(
-    () => bus.subscribe({ name: "task.status_changed", delivery: { mode: "webhook", url: "https://example.com", secret: "short" } }, "c"),
+    () => bus.subscribe({ name: "task.status_changed", arguments: { agent_id: "a" }, delivery: { mode: "webhook", url: "https://example.com", secret: "short" } }, auth),
     /whsec_/,
   );
 });

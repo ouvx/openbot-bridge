@@ -2,6 +2,8 @@
 
 ローカルの OpenBot を MCP クライアントから参照するための Node.js サーバーです。この配布候補は、認証済みのクライアントに接続確認と許可済みエージェント一覧を提供します。
 
+配布名・ライセンスは所有者の決定待ちです。
+
 <!-- TODO: OpenBot・ChatGPT との関係を表す名称、非公式表記と配布条件を公開前に確定する。 -->
 
 ## ローカルでの確認
@@ -10,7 +12,7 @@ Node.js 24、npm、Git、Python 3 を使用します。Linux の OpenBot デス�
 
 ```sh
 npm ci --ignore-scripts
-node scripts/setup.mjs
+sh scripts/setup.sh
 npm test
 npm run doctor
 npm start

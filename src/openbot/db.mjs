@@ -100,20 +100,15 @@ export class OpenBotDb {
   }
 
   /** Messages of one thread, oldest first. `beforeOrdinal` pages backwards. */
-  messages(threadId, { limit = 40, beforeOrdinal = null } = {}) {
-    const rows = beforeOrdinal === null
-      ? this.#all(
-          `SELECT message_id, turn_id, author, status, item_type, created_at, ordinal, message_json
-             FROM projection_thread_messages WHERE thread_id = ?
-             ORDER BY ordinal DESC LIMIT ?`,
-          [threadId, limit],
-        )
-      : this.#all(
-          `SELECT message_id, turn_id, author, status, item_type, created_at, ordinal, message_json
-             FROM projection_thread_messages WHERE thread_id = ? AND ordinal < ?
-             ORDER BY ordinal DESC LIMIT ?`,
-          [threadId, beforeOrdinal, limit],
-        );
+  messages(threadId, { agentId, limit = 40, beforeOrdinal = null } = {}) {
+    if (!agentId) return [];
+    const rows = this.#all(
+      `SELECT m.message_id, m.turn_id, m.author, m.status, m.item_type, m.created_at, m.ordinal, m.message_json
+         FROM projection_thread_messages m JOIN projection_threads t ON t.thread_id = m.thread_id
+        WHERE t.agent_id = ? AND m.thread_id = ? AND (? IS NULL OR m.ordinal < ?)
+        ORDER BY m.ordinal DESC LIMIT ?`,
+      [agentId, threadId, beforeOrdinal, beforeOrdinal, limit],
+    );
     return rows
       .map((row) => {
         const message = safeJson(row.message_json) || {};
@@ -132,9 +127,10 @@ export class OpenBotDb {
   }
 
   /** Tool calls, plan updates and other turn activities: the agent's execution log. */
-  activities({ turnId = null, threadId = null, since = null, limit = 100 } = {}) {
-    const filters = [];
-    const params = [];
+  activities({ agentId, turnId = null, threadId = null, since = null, limit = 100 } = {}) {
+    if (!agentId || !threadId) return [];
+    const filters = ["thread_id IN (SELECT thread_id FROM projection_threads WHERE agent_id = ?)"];
+    const params = [agentId];
     if (turnId) {
       filters.push("turn_id = ?");
       params.push(turnId);
@@ -147,7 +143,6 @@ export class OpenBotDb {
       filters.push("created_at >= ?");
       params.push(since);
     }
-    if (filters.length === 0) return [];
     params.push(limit);
     const rows = this.#all(
       `SELECT activity_id, thread_id, turn_id, activity_type, payload_json, created_at
@@ -212,34 +207,6 @@ export class OpenBotDb {
       timezone: row.timezone,
       updatedAt: row.updated_at,
     }));
-  }
-
-  /** Files an agent produced or that were attached to its messages. */
-  attachments({ agentId = null, limit = 30 } = {}) {
-    const rows = agentId
-      ? this.#all(
-          `SELECT attachment_id, owner_kind, owner_id, name, path, metadata_json, created_at
-             FROM projection_attachments
-            WHERE owner_id = ? OR path LIKE ? ORDER BY created_at DESC LIMIT ?`,
-          [agentId, `%/${agentId}/%`, limit],
-        )
-      : this.#all(
-          `SELECT attachment_id, owner_kind, owner_id, name, path, metadata_json, created_at
-             FROM projection_attachments ORDER BY created_at DESC LIMIT ?`,
-          [limit],
-        );
-    return rows.map((row) => {
-      const meta = safeJson(row.metadata_json) || {};
-      return {
-        id: row.attachment_id,
-        name: row.name,
-        path: row.path,
-        kind: meta.kind ?? row.owner_kind,
-        mimeType: meta.mimeType ?? null,
-        size: typeof meta.size === "number" ? meta.size : null,
-        createdAt: row.created_at,
-      };
-    });
   }
 
   /** Simple text search inside one agent's thread messages. */

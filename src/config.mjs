@@ -25,7 +25,9 @@ export function loadConfig(env = process.env, overrides = {}) {
       automationDir: env.OPENBOT_AUTOMATION_DIR || join(openbotConfig, "automation"),
       configDir: openbotConfig,
     },
-    allowedAgents: (env.BRIDGE_ALLOWED_AGENTS || "")
+    clientAgentIds: JSON.parse(env.BRIDGE_CLIENT_AGENT_IDS || "{}"),
+    allowedOrigins: (env.BRIDGE_ALLOWED_ORIGINS || "").split(",").map(s => s.trim()).filter(Boolean),
+    allowedAgents: (env.BRIDGE_ALLOWED_AGENT_IDS ?? env.BRIDGE_ALLOWED_AGENTS ?? "")
       .split(",")
       .map((value) => value.trim())
       .filter(Boolean),
@@ -55,13 +57,22 @@ export function loadConfig(env = process.env, overrides = {}) {
     },
   };
 
+  if (!Array.isArray(config.allowedAgents) || !config.allowedAgents.every(s => typeof s === "string" && s.length > 0)) {
+    throw new Error("BRIDGE_ALLOWED_AGENT_IDS must contain agent IDs.");
+  }
+  if (!config.clientAgentIds || Array.isArray(config.clientAgentIds) || typeof config.clientAgentIds !== "object" ||
+      !Object.values(config.clientAgentIds).every(ids => Array.isArray(ids) && ids.every(id => typeof id === "string" && id.length > 0))) {
+    throw new Error("BRIDGE_CLIENT_AGENT_IDS must be a JSON object mapping clients to agent ID arrays.");
+  }
+  if (!Array.isArray(config.allowedOrigins) || !config.allowedOrigins.every(validOrigin)) {
+    throw new Error("BRIDGE_ALLOWED_ORIGINS must contain exact HTTPS origins or loopback HTTP origins.");
+  }
+  if (!Number.isSafeInteger(config.limits.artifactBytes) || config.limits.artifactBytes < 1) {
+    throw new Error("BRIDGE_MAX_ARTIFACT_BYTES must be a positive byte count.");
+  }
   if (config.events) throw new Error("Events delivery is disabled in this release.");
-  if (config.publicUrl) {
-    const url = new URL(config.publicUrl);
-    const localHttp = url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
-    if (url.origin !== config.publicUrl || (!localHttp && url.protocol !== "https:")) {
-      throw new Error("BRIDGE_PUBLIC_URL must be an HTTPS origin or a loopback HTTP origin.");
-    }
+  if (config.publicUrl && !validOrigin(config.publicUrl)) {
+    throw new Error("BRIDGE_PUBLIC_URL must be an HTTPS origin or a loopback HTTP origin.");
   }
   if (!Number.isInteger(config.port) || config.port < 0 || config.port > 65535) throw new Error("BRIDGE_PORT must be a TCP port.");
   if (config.adminSecret.length < 16) {
@@ -70,9 +81,14 @@ export function loadConfig(env = process.env, overrides = {}) {
   return config;
 }
 
-export function publicUrlOf(config, request) {
-  if (config.publicUrl) return config.publicUrl;
-  return `http://${request.headers.host || `${config.host}:${config.port}`}`;
+function validOrigin(value) {
+  try {
+    const url = new URL(value);
+    const local = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+    return url.origin === value && (url.protocol === "https:" || (url.protocol === "http:" && local));
+  } catch {
+    return false;
+  }
 }
 
 export function isAgentAllowed(config, agentId) {

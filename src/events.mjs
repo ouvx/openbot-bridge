@@ -1,19 +1,21 @@
 import { createHash, randomBytes, timingSafeEqual, createHmac } from "node:crypto";
-import { lookup } from "node:dns/promises";
-import { isIP } from "node:net";
+import { resolveCallback, postPinned, CallbackValidationError } from "./callback.mjs";
+export { resolveCallback as assertPublicHttps, isPrivateAddress } from "./callback.mjs";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 const SECRET_PREFIX = "whsec_";
 
-/**
- * MCP Events support (官方: ChatGPT が購読し、bridge が Webhook で通知する).
- *
- * Implemented defensively: only HTTPS callbacks, no redirects, private
- * addresses refused, Standard Webhooks HMAC signatures, a single-use challenge
- * before the first delivery, and a deterministic subscription id so a repeated
- * subscribe refreshes instead of duplicating.
- */
+const eventScopes = new Map([
+  ["task.status_changed", "openbot.read"],
+  ["task.needs_person", "openbot.read"],
+]);
+
+function canSubscribe(auth, name, agentId) {
+  return Boolean(auth?.ok && auth.clientId && auth.grantId && eventScopes.has(name) &&
+    auth.scopes.includes(eventScopes.get(name)) && agentId && auth.allowedAgentIds.includes(agentId));
+}
+
 export class EventBus {
   #file;
   #stateFile;
@@ -23,16 +25,18 @@ export class EventBus {
   #jobs;
   #db;
   #timer = null;
+  #grantAllows;
 
-  constructor({ dataDir, logger, jobs, db }) {
+  constructor({ dataDir, logger, jobs, db, grantAllows = () => false }) {
     this.#file = join(dataDir, "events", "subscriptions.json");
     this.#stateFile = join(dataDir, "events", "delivered.json");
     this.#logger = logger;
     this.#jobs = jobs;
     this.#db = db;
+    this.#grantAllows = grantAllows;
   }
 
-  definitions() {
+  definitions(auth) {
     return [
       {
         name: "task.status_changed",
@@ -44,6 +48,7 @@ export class EventBus {
             agent_id: { type: "string", description: "Only report tasks for this agent id." },
           },
           additionalProperties: false,
+          required: ["agent_id"],
         },
         payloadSchema: {
           type: "object",
@@ -69,6 +74,7 @@ export class EventBus {
             agent_id: { type: "string", description: "Only report this agent id." },
           },
           additionalProperties: false,
+          required: ["agent_id"],
         },
         payloadSchema: {
           type: "object",
@@ -83,14 +89,14 @@ export class EventBus {
           additionalProperties: false,
         },
       },
-    ];
+    ].filter(event => auth?.ok && auth.scopes.includes(eventScopes.get(event.name)));
   }
 
   async init() {
     await mkdir(dirname(this.#file), { recursive: true, mode: 0o700 });
     try {
       const loaded = JSON.parse(await readFile(this.#file, "utf8"));
-      for (const sub of loaded) if (sub.expiresAt > Date.now()) this.#subscriptions.set(sub.id, sub);
+      for (const sub of loaded) if (sub.grantId && sub.clientId && sub.agentId && Array.isArray(sub.addresses) && sub.expiresAt > Date.now()) this.#subscriptions.set(sub.id, sub);
     } catch {
       // none
     }
@@ -117,9 +123,10 @@ export class EventBus {
   }
 
   /** events/subscribe */
-  async subscribe({ name, arguments: args = {}, delivery = {}, cursor = null }, principal) {
-    const definition = this.definitions().find((event) => event.name === name);
-    if (!definition) throw new EventError("unknown_event", `The bridge does not offer an event named ${name}.`);
+  async subscribe({ name, arguments: args = {}, delivery = {}, cursor = null }, auth) {
+    if (!eventScopes.has(name)) throw new EventError("unknown_event", `The bridge does not offer an event named ${name}.`);
+    const agentId = args.agent_id;
+    if (!canSubscribe(auth, name, agentId)) throw new EventError("forbidden", "Subscription is not allowed for this grant.");
     if (delivery.mode !== "webhook") throw new EventError("unsupported_delivery", "Only webhook delivery is supported.");
     const url = String(delivery.url ?? "");
     const secret = String(delivery.secret ?? "");
@@ -127,21 +134,23 @@ export class EventBus {
     if (!secret.startsWith(SECRET_PREFIX)) throw new EventError("invalid_secret", "The signing secret must start with whsec_.");
     const key = Buffer.from(secret.slice(SECRET_PREFIX.length), "base64");
     if (key.length < 24 || key.length > 64) throw new EventError("invalid_secret", "The signing secret must decode to 24–64 bytes.");
-    await assertPublicHttps(url);
-    const agentId = typeof args.agent_id === "string" ? args.agent_id : null;
+    const addresses = await resolveCallback(url);
     const id = `sub_${createHash("sha256")
-      .update(`${principal}|${url}|${name}|${canonicalJson(args)}`)
+      .update(`${auth.clientId}|${auth.grantId}|${url}|${name}|${canonicalJson(args)}`)
       .digest("base64url")
       .slice(0, 24)}`;
     const existing = this.#subscriptions.get(id);
+    if (existing && JSON.stringify(existing.addresses) !== JSON.stringify(addresses)) {
+      throw new EventError("callback_changed", "Callback address set changed.");
+    }
     const subscription = {
       id,
-      principal,
+      clientId: auth.clientId, grantId: auth.grantId, addresses,
       name,
       agentId,
       url,
       secret,
-      verified: existing?.verified ? existing.verifiedAt > Date.now() - 24 * 60 * 60 * 1000 : false,
+      verified: existing?.verified && existing.secret === secret ? existing.verifiedAt > Date.now() - 24 * 60 * 60 * 1000 : false,
       verifiedAt: existing?.verifiedAt ?? 0,
       createdAt: existing?.createdAt ?? new Date().toISOString(),
       expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000,
@@ -166,9 +175,9 @@ export class EventBus {
     };
   }
 
-  async unsubscribe(id, principal) {
+  async unsubscribe(id, auth) {
     const subscription = this.#subscriptions.get(id);
-    if (!subscription || (principal && subscription.principal !== principal)) return { removed: false };
+    if (!subscription || !auth?.ok || subscription.clientId !== auth.clientId || subscription.grantId !== auth.grantId) return { removed: false };
     this.#subscriptions.delete(id);
     await this.#save();
     return { removed: true };
@@ -209,7 +218,8 @@ export class EventBus {
       this.#seen.set(job.id, job.status);
       changed = true;
       for (const sub of this.#subscriptions.values()) {
-        if (sub.agentId && sub.agentId !== job.agentId) continue;
+        if (sub.agentId !== job.agentId || sub.grantId !== job.ownerGrantId || sub.clientId !== job.ownerClientId) continue;
+        if (!this.#grantAllows(sub.grantId, sub.clientId, sub.agentId, eventScopes.get(sub.name))) continue;
         if (sub.name === "task.status_changed") {
           await this.#deliver(sub, {
             eventId: `evt_${randomBytes(12).toString("hex")}`,
@@ -252,38 +262,36 @@ export class EventBus {
     }
     for (let attempt = 0; attempt < 3; attempt++) {
       const result = await this.#post(subscription, event.eventId, event, body);
-      if (result.ok) return;
+      if (result.ok || result.permanent) return;
       await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
     }
     this.#logger.warn("Event delivery failed", { id: subscription.id, eventId: event.eventId });
   }
 
   async #post(subscription, webhookId, payload, body = JSON.stringify(payload)) {
-    await assertPublicHttps(subscription.url).catch(() => {});
+    if (!this.#grantAllows(subscription.grantId, subscription.clientId, subscription.agentId, eventScopes.get(subscription.name))) {
+      this.#logger.warn("Event delivery refused", { id: subscription.id, reason: "grant" });
+      return { ok: false, permanent: true, reason: "invalid grant" };
+    }
     const timestamp = String(Math.floor(Date.now() / 1000));
-    const signature = sign(subscription.secret, webhookId, timestamp, body);
     try {
-      const response = await fetch(subscription.url, {
-        method: "POST",
-        redirect: "error",
-        signal: AbortSignal.timeout(10_000),
-        headers: {
-          "content-type": "application/json",
-          "webhook-id": webhookId,
-          "webhook-timestamp": timestamp,
-          "webhook-signature": signature,
-          "X-MCP-Subscription-Id": subscription.id,
-        },
-        body,
-      });
-      if (!response.ok) return { ok: false, reason: `HTTP ${response.status}` };
+      const response = await postPinned(subscription.url, subscription.addresses, {
+        "content-type": "application/json",
+        "webhook-id": webhookId,
+        "webhook-timestamp": timestamp,
+        "webhook-signature": sign(subscription.secret, webhookId, timestamp, body),
+        "X-MCP-Subscription-Id": subscription.id,
+      }, body);
+      if (response.status < 200 || response.status >= 300) return { ok: false, reason: "Callback rejected delivery." };
       if (payload.type === "verification") {
-        const answer = await response.json().catch(() => null);
-        return { ok: Boolean(answer && answer.challenge === payload.challenge), reason: "challenge did not match" };
+        const answer = JSON.parse(response.body);
+        return { ok: answer?.challenge === payload.challenge, reason: "Challenge did not match." };
       }
       return { ok: true };
     } catch (error) {
-      return { ok: false, reason: error instanceof Error ? error.message : "network error" };
+      const reason = error instanceof CallbackValidationError ? "address_validation" : "transport_or_response";
+      this.#logger.warn("Event delivery refused", { id: subscription.id, reason });
+      return { ok: false, permanent: true, reason: "Destination verification or transport failed." };
     }
   }
 }
@@ -303,35 +311,6 @@ function canonicalJson(value) {
       .join(",")}}`;
   }
   return JSON.stringify(value ?? null);
-}
-
-/** Refuses callbacks that point at a private address or use a non-HTTPS scheme. */
-export async function assertPublicHttps(url) {
-  const parsed = new URL(url);
-  if (parsed.protocol !== "https:") throw new EventError("invalid_callback", "The callback URL must be HTTPS.");
-  if (parsed.username || parsed.password) throw new EventError("invalid_callback", "The callback URL must not contain credentials.");
-  const host = parsed.hostname;
-  const addresses = isIP(host) ? [{ address: host }] : await lookup(host, { all: true });
-  for (const { address } of addresses) {
-    if (isPrivateAddress(address)) throw new EventError("invalid_callback", "The callback URL must not point at a private address.");
-  }
-  return true;
-}
-
-export function isPrivateAddress(address) {
-  const privateRanges = [
-    /^10\./,
-    /^127\./,
-    /^169\.254\./,
-    /^192\.168\./,
-    /^172\.(1[6-9]|2\d|3[01])\./,
-    /^0\./,
-    /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./,
-    /^::1$/,
-    /^f[cd][0-9a-f]{2}:/i,
-    /^fe80:/i,
-  ];
-  return privateRanges.some((pattern) => pattern.test(address));
 }
 
 export class EventError extends Error {

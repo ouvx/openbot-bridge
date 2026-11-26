@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
-import { loadConfig, publicUrlOf } from "./config.mjs";
+import { loadConfig } from "./config.mjs";
 import { createAuditLog, createLogger, maskSecrets } from "./log.mjs";
 import { OpenBotDb } from "./openbot/db.mjs";
 import { AutomationClient } from "./openbot/automation.mjs";
@@ -25,16 +25,12 @@ export async function startBridge(overrides = {}) {
   const jobs = new JobStore({ dataDir: config.dataDir, automation, logger, db });
   if (config.extendedTools) await jobs.init();
 
-  const oauth = new OAuthServer({
-    dataDir: config.dataDir,
-    adminSecret: config.adminSecret,
-    publicUrl: config.publicUrl || `http://127.0.0.1:${config.port}`,
-    logger,
-  });
-  await oauth.init();
-
+  let oauth;
   const eventsEnabled = config.events === true;
-  const events = new EventBus({ dataDir: config.dataDir, logger, jobs, db });
+  const events = new EventBus({
+    dataDir: config.dataDir, logger, jobs, db,
+    grantAllows: (...args) => oauth.grantAllowsAgent(...args),
+  });
   if (eventsEnabled) await events.init();
 
   const rate = new RateLimiter(config.limits.requestsPerMinute, config.limits.writesPerMinute);
@@ -91,6 +87,10 @@ export async function startBridge(overrides = {}) {
   };
 
   const httpServer = createServer(async (req, res) => {
+    if (!oauth) {
+      sendJson(res, 503, { error: "initializing" });
+      return;
+    }
     const started = Date.now();
     const host = String(req.headers.host ?? "");
 
@@ -99,7 +99,7 @@ export async function startBridge(overrides = {}) {
       return;
     }
 
-    if (req.headers.origin !== undefined && !originAllowed(config, req.headers.origin)) {
+    if (req.headers.origin !== undefined && !config.allowedOrigins.includes(req.headers.origin)) {
       sendJson(res, 403, { error: "This origin is not allowed." });
       return;
     }
@@ -121,8 +121,8 @@ export async function startBridge(overrides = {}) {
         return;
       }
 
-      if (url.pathname === "/.well-known/oauth-protected-resource") {
-        sendJson(res, 200, { ...oauth.protectedResourceMetadata(), resource: resourceBase(config, req) });
+      if (["/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"].includes(url.pathname)) {
+        sendJson(res, 200, oauth.protectedResourceMetadata());
         return;
       }
       if (url.pathname === "/.well-known/oauth-authorization-server") {
@@ -154,12 +154,19 @@ export async function startBridge(overrides = {}) {
         return;
       }
 
+      if (url.pathname === "/oauth/revoke" && req.method === "POST") {
+        await oauth.revoke(new URLSearchParams(await readFormBody(req)));
+        res.writeHead(200, { "cache-control": "no-store" });
+        res.end();
+        return;
+      }
+
       if (url.pathname === "/mcp") {
-        const auth = oauth.verify(req.headers.authorization);
+        const auth = oauth.verify(req.headers.authorization, oauth.issuer);
         if (!auth.ok) {
           res.writeHead(401, {
             "content-type": "application/json",
-            "www-authenticate": `Bearer resource_metadata="${resourceBase(config, req)}/.well-known/oauth-protected-resource"`,
+            "www-authenticate": `Bearer resource_metadata="${oauth.issuer}/.well-known/oauth-protected-resource", scope="openbot.read"`,
             "cache-control": "no-store",
           });
           res.end(JSON.stringify({ error: "unauthorized", reason: auth.reason }));
@@ -211,6 +218,20 @@ export async function startBridge(overrides = {}) {
   });
   const address = httpServer.address();
   if (address && typeof address === "object" && address.port && config.port === 0) config.port = address.port;
+  try {
+    const server = new OAuthServer({
+      dataDir: config.dataDir, adminSecret: config.adminSecret, logger,
+      publicUrl: config.publicUrl || `http://127.0.0.1:${config.port}`,
+      allowedAgentIds: config.allowedAgents, clientAgentIds: config.clientAgentIds,
+    });
+    await server.init();
+    oauth = server;
+  } catch (error) {
+    clearInterval(sweeper);
+    await new Promise(resolve => httpServer.close(resolve));
+    db.close();
+    throw error;
+  }
   if (eventsEnabled) events.start();
   logger.info(`OpenBot Bridge ${VERSION} listening on http://${config.host}:${config.port}`, {
     publicUrl: config.publicUrl || "(not set)",
@@ -242,7 +263,8 @@ export async function startBridge(overrides = {}) {
 async function handleMcp({ req, res, sessions, auth, buildSession, logger }) {
   const sessionId = req.headers["mcp-session-id"];
   const session = typeof sessionId === "string" ? sessions.get(sessionId) : null;
-  if (session && (session.auth.clientId !== auth.clientId ||
+  if (session && (session.auth.clientId !== auth.clientId || session.auth.grantId !== auth.grantId ||
+      !session.auth.allowedAgentIds.every(id => auth.allowedAgentIds.includes(id)) ||
       !session.auth.scopes.every((scope) => auth.scopes.includes(scope)))) {
     sendJson(res, 403, { error: "session_authorization_mismatch" });
     return;
@@ -284,7 +306,7 @@ async function handleMcp({ req, res, sessions, auth, buildSession, logger }) {
 
   if (req.method === "GET" || req.method === "DELETE") {
     if (!session) {
-      sendJson(res, 400, { jsonrpc: "2.0", id: null, error: { code: -32000, message: "Bad session id." } });
+      sendJson(res, sessionId ? 404 : 400, { jsonrpc: "2.0", id: null, error: { code: -32000, message: "Bad session id." } });
       return;
     }
     session.lastUsed = Date.now();
@@ -298,19 +320,16 @@ async function handleMcp({ req, res, sessions, auth, buildSession, logger }) {
 
 function registerEventHandlers(server, events, auth) {
   const low = server.server;
-  const listSchema = { method: "events/list" };
-  const subscribeSchema = { method: "events/subscribe" };
-  const unsubscribeSchema = { method: "events/unsubscribe" };
   const passthrough = (method) => ({
     parse: (value) => {
       if (!value || value.method !== method) throw new Error(`Expected ${method}`);
       return value;
     },
   });
-  low.setRequestHandler(passthrough("events/list"), async () => ({ events: events.definitions() }));
+  low.setRequestHandler(passthrough("events/list"), async () => ({ events: events.definitions(auth) }));
   low.setRequestHandler(passthrough("events/subscribe"), async (request) => {
     try {
-      return await events.subscribe(request.params ?? {}, auth.clientId ?? "anonymous");
+      return await events.subscribe(request.params ?? {}, auth);
     } catch (error) {
       if (error instanceof EventError) throw new EventError(error.reason, error.message);
       throw error;
@@ -318,11 +337,8 @@ function registerEventHandlers(server, events, auth) {
   });
   low.setRequestHandler(passthrough("events/unsubscribe"), async (request) => {
     const id = request.params?.id ?? request.params?.subscriptionId;
-    return events.unsubscribe(id, auth.clientId ?? "anonymous");
+    return events.unsubscribe(id, auth);
   });
-  void listSchema;
-  void subscribeSchema;
-  void unsubscribeSchema;
 }
 
 class RateLimiter {
@@ -364,16 +380,6 @@ function hostAllowed(config, host) {
     if (extra.trim()) allowed.add(extra.trim());
   }
   return allowed.has(host);
-}
-
-function originAllowed(config, origin) {
-  const localHosts = ["127.0.0.1", "localhost", "[::1]"];
-  return (Boolean(config.publicUrl) && origin === config.publicUrl) ||
-    localHosts.some(host => origin === new URL(`http://${host}:${config.port}`).origin);
-}
-
-function resourceBase(config, req) {
-  return config.publicUrl || `http://${req.headers.host ?? `127.0.0.1:${config.port}`}`;
 }
 
 function sendJson(res, status, value) {

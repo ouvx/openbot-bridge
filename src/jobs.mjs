@@ -53,9 +53,9 @@ export class JobStore {
     return this.#jobs.size;
   }
 
-  findByIdempotencyKey(key) {
+  findByIdempotencyKey(key, owner) {
     if (!key) return null;
-    for (const job of this.#jobs.values()) if (job.idempotencyKey === key) return job;
+    for (const job of this.#jobs.values()) if (job.idempotencyKey === key && belongsToGrant(job, owner)) return job;
     return null;
   }
 
@@ -63,18 +63,22 @@ export class JobStore {
     return this.#jobs.get(id) ?? null;
   }
 
-  list({ agentId = null, status = null, limit = 20 } = {}) {
+  list({ agentId = null, status = null, limit = 20, accepts = null } = {}) {
     let jobs = [...this.#jobs.values()];
+    if (accepts) jobs = jobs.filter(accepts);
     if (agentId) jobs = jobs.filter((job) => job.agentId === agentId);
     if (status) jobs = jobs.filter((job) => job.status === status);
     return jobs.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))).slice(0, limit);
   }
 
-  async create({ agentId, kind, title, prompt, idempotencyKey = null }) {
+  async create({ agentId, kind, title, prompt, idempotencyKey = null, owner }) {
+    if (!owner?.clientId || !owner.grantId) throw new Error("Authenticated grant required.");
     const now = new Date().toISOString();
     const job = {
       id: `job_${randomUUID()}`,
       kind,
+      ownerClientId: owner.clientId,
+      ownerGrantId: owner.grantId,
       agentId,
       title: title || prompt.slice(0, 80),
       prompt,
@@ -122,8 +126,9 @@ export class JobStore {
     if (job.deliveryId) return job;
     const receipt = await this.#automation.sendMessage(job.agentId, job.prompt, job.id);
     const delivery = Array.isArray(receipt?.deliveries)
-      ? receipt.deliveries.find((item) => item.recipientAgentId === job.agentId) ?? receipt.deliveries[0]
+      ? receipt.deliveries.find((item) => item.recipientAgentId === job.agentId) ?? null
       : null;
+    if (!delivery?.id) throw new Error("OpenBot returned no delivery for the requested agent.");
     job.messageId = receipt?.messageId ?? null;
     job.deliveryId = delivery?.id ?? null;
     job.status = delivery?.status === "running" ? "running" : "queued";
@@ -166,7 +171,7 @@ export class JobStore {
     if (job.turnId && !job.answer && this.#db) {
       try {
         const turn = this.#db.turn(job.turnId);
-        if (turn && turn.status === "completed" && !ENDED.has(job.status)) {
+        if (turn && this.#db.thread(turn.threadId)?.agentId === job.agentId && turn.status === "completed" && !ENDED.has(job.status)) {
           job.status = "completed";
           this.note(job, "completed", "OpenBot finished the turn.");
         }
@@ -198,4 +203,9 @@ export class JobStore {
 
 export function isEnded(status) {
   return ENDED.has(status);
+}
+
+export function belongsToGrant(job, owner) {
+  return Boolean(owner?.clientId && owner?.grantId &&
+    job?.ownerClientId === owner.clientId && job?.ownerGrantId === owner.grantId);
 }
