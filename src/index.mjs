@@ -233,6 +233,7 @@ export async function startBridge(overrides = {}) {
     await server.init();
     if (config.extendedTools) operations = new OperationStore({
       dataDir: config.dataDir, ttlSeconds: config.approvalTtlSeconds,
+      issuanceGrantLimit: config.limits.approvalsPerGrantPerMinute, issuanceGlobalLimit: config.limits.globalApprovalsPerMinute,
       subjectLimit: config.limits.writesPerMinute, globalLimit: config.limits.globalWritesPerMinute,
     });
     oauth = server;

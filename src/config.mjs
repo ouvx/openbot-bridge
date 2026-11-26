@@ -41,6 +41,8 @@ export function loadConfig(env = process.env, overrides = {}) {
     openbot: { ...{ dbPath: env.OPENBOT_DB || join(openbotConfig, "openbot.db"), automationDir: env.OPENBOT_AUTOMATION_DIR || join(openbotConfig, "automation"), configDir: openbotConfig }, ...(overrides.openbot ?? {}) },
     limits: {
       requestsPerMinute: Number(env.BRIDGE_RPM || 90),
+      approvalsPerGrantPerMinute: Number(env.BRIDGE_APPROVALS_PER_GRANT_PER_MINUTE ?? 8),
+      globalApprovalsPerMinute: Number(env.BRIDGE_GLOBAL_APPROVALS_PER_MINUTE ?? 40),
       writesPerMinute: Number(env.BRIDGE_WRITES_PER_MINUTE ?? 12),
       globalWritesPerMinute: Number(env.BRIDGE_GLOBAL_WRITES_PER_MINUTE ?? 60),
       maxMessageChars: Number(env.BRIDGE_MAX_MESSAGE_CHARS || 12000),
@@ -64,7 +66,8 @@ export function loadConfig(env = process.env, overrides = {}) {
   if (!Number.isSafeInteger(config.limits.artifactBytes) || config.limits.artifactBytes < 1) {
     throw new Error("BRIDGE_MAX_ARTIFACT_BYTES must be a positive byte count.");
   }
-  for (const value of [config.approvalTtlSeconds, config.limits.writesPerMinute, config.limits.globalWritesPerMinute, config.limits.requestsPerMinute]) {
+  for (const value of [config.approvalTtlSeconds, config.limits.writesPerMinute, config.limits.globalWritesPerMinute,
+    config.limits.approvalsPerGrantPerMinute, config.limits.globalApprovalsPerMinute, config.limits.requestsPerMinute]) {
     if (!Number.isSafeInteger(value) || value < 1) throw new Error("Approval lifetime and rate limits must be positive integers.");
   }
   if (config.approvalTtlSeconds > 3600) throw new Error("Approval lifetime exceeds one hour.");

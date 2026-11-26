@@ -162,3 +162,75 @@ test("audit records bind identity and hashes without raw arguments, and an audit
     row.approvalId === signed.approvalId && row.tool === input.tool && /^[0-9a-f]{64}$/.test(row.argsHash)));
   assert.ok(!JSON.stringify(rows).includes(input.args.message.trim()));
 });
+
+test("new approval issuance enforces rolling grant and service budgets before insertion", async t => {
+  const { store, input, inspect, advance } = fixture(t, { issuanceGrantLimit: 1, issuanceGlobalLimit: 2 });
+  const request = (grantId, key) => ({ ...input, auth: { ...input.auth, grantId }, idempotencyKey: key });
+  const first = request("A", "first");
+  const pending = store.prepare(first);
+  assert.equal(store.prepare(first).approvalId, pending.approvalId);
+  store.decide(pending.approvalId, pending.summaryHash, true);
+  assert.deepEqual(await store.execute({ ...first, approvalId: pending.approvalId }, () => ({ ok: true })), { ok: true });
+  assert.throws(() => store.prepare(request("A", "second")), { code: "approval_issue_rate_limited" });
+
+  const second = request("B", "another");
+  const declined = store.prepare(second);
+  store.decide(declined.approvalId, declined.summaryHash, false);
+  advance(59999);
+  assert.throws(() => store.prepare(request("C", "next")), { code: "approval_issue_rate_limited" });
+  assert.deepEqual(store.prepare(first), { cached: true, result: { ok: true } });
+  assert.equal(inspect.prepare("SELECT count(*) AS n FROM approvals").get().n, 2);
+  assert.equal(inspect.prepare("SELECT count(*) AS n FROM operation_audit WHERE outcome='approval_issue_rate_limited'").get().n, 2);
+  advance(1);
+  assert.ok(store.prepare(request("A", "second")).approvalId);
+});
+
+test("result storage failure after dispatch reports an unrecorded result and never repeats the action", async t => {
+  const { store, approve, inspect, input } = fixture(t);
+  const signed = approve();
+  inspect.exec("CREATE TRIGGER fail_result BEFORE UPDATE OF result ON approvals BEGIN SELECT RAISE(ABORT, 'cannot save'); END");
+  let sent = 0;
+  const send = () => ({ sequence: ++sent });
+  await assert.rejects(store.execute(signed, send), { code: "operation_result_unrecorded" });
+  assert.equal(inspect.prepare("SELECT outcome FROM operation_audit ORDER BY eventId DESC").get().outcome, "operation_result_unrecorded");
+  assert.throws(() => store.prepare(input), { code: "operation_in_progress_or_uncertain" });
+  await assert.rejects(store.execute(signed, send), { code: "approval_used" });
+  assert.equal(sent, 1);
+});
+
+test("result and audit storage loss after dispatch preserve the unrecorded-result code", async t => {
+  const { store, approve, inspect } = fixture(t);
+  const signed = approve();
+  let sent = 0;
+  await assert.rejects(store.execute(signed, () => {
+    sent++;
+    inspect.exec("CREATE TRIGGER fail_audit BEFORE INSERT ON operation_audit BEGIN SELECT RAISE(ABORT, 'cannot audit'); END");
+    return { sent };
+  }), { code: "operation_result_unrecorded" });
+  assert.equal(sent, 1);
+  const row = inspect.prepare("SELECT state,result FROM approvals WHERE approvalId=?").get(signed.approvalId);
+  assert.equal(row.state, "executing");
+  assert.equal(row.result, null);
+});
+
+test("denial audit records why its arguments could not be hashed without logging their values", t => {
+  const { store, input, inspect } = fixture(t);
+  const args = { privateExample: Infinity };
+  store.recordDenial({ ...input, args }, "invalid_arguments");
+  const audit = inspect.prepare("SELECT * FROM operation_audit").get();
+  assert.equal(audit.outcome, "invalid_arguments:args_hash_unavailable");
+  assert.equal(audit.argsHash, null);
+  assert.ok(!JSON.stringify(audit).includes("privateExample"));
+});
+
+test("a busy approval database reports contention before any action runs", async t => {
+  const { store, approve, inspect } = fixture(t);
+  const signed = approve();
+  let sent = 0;
+  inspect.exec("BEGIN IMMEDIATE");
+  try {
+    await assert.rejects(store.execute(signed, () => ++sent), { code: "operation_store_busy" });
+    assert.equal(sent, 0);
+  } finally { inspect.exec("ROLLBACK"); }
+  assert.equal(await store.execute(signed, () => ++sent), 1);
+});

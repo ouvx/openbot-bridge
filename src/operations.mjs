@@ -5,9 +5,16 @@ import { DatabaseSync } from "node:sqlite";
 
 const hash = text => createHash("sha256").update(text, "utf8").digest("hex");
 export class OperationError extends Error {
-  constructor(code) { super(code); this.code = code; }
+  constructor(code, options) { super(code, options); this.code = code; }
 }
 const deny = code => { throw new OperationError(code); };
+function storeErrorCode(error) {
+  if (error instanceof OperationError) return error.code;
+  // The low byte of SQLite's extended result code is the primary result code (5 = BUSY).
+  if (error?.code === "ERR_SQLITE_ERROR" && (error.errcode & 255) === 5) return "operation_store_busy";
+  return "operation_store_unavailable";
+}
+
 const approvalIdPattern = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i;
 
 // Canonical JSON: trim + NFC strings (including keys), sort keys by UTF-16 code
@@ -53,12 +60,18 @@ export class OperationStore {
   #subjectLimit;
   #globalLimit;
 
-  constructor({ dataDir, ttlSeconds = 120, subjectLimit = 12, globalLimit = 60, now = Date.now }) {
-    if (![ttlSeconds, subjectLimit, globalLimit].every(n => Number.isSafeInteger(n) && n > 0)) deny("invalid_operation_limits");
+  #issuanceGrantLimit;
+  #issuanceGlobalLimit;
+
+  constructor({ dataDir, ttlSeconds = 120, subjectLimit = 12, globalLimit = 60,
+    issuanceGrantLimit = 8, issuanceGlobalLimit = 40, now = Date.now }) {
+    if (![ttlSeconds, subjectLimit, globalLimit, issuanceGrantLimit, issuanceGlobalLimit].every(n => Number.isSafeInteger(n) && n > 0)) deny("invalid_operation_limits");
     this.#now = now;
     this.#ttl = ttlSeconds * 1000;
     this.#subjectLimit = subjectLimit;
     this.#globalLimit = globalLimit;
+    this.#issuanceGrantLimit = issuanceGrantLimit;
+    this.#issuanceGlobalLimit = issuanceGlobalLimit;
     mkdirSync(dataDir, { recursive: true, mode: 0o700 });
     const dir = lstatSync(dataDir);
     const uid = process.getuid?.();
@@ -81,6 +94,7 @@ export class OperationStore {
           state TEXT NOT NULL, usedAt INTEGER, result TEXT
         );
         CREATE INDEX IF NOT EXISTS op_key ON approvals(opKey);
+        CREATE INDEX IF NOT EXISTS op_issued ON approvals(issuedAt,grantId);
         CREATE INDEX IF NOT EXISTS op_used ON approvals(usedAt);
         CREATE TABLE IF NOT EXISTS operation_audit (
           eventId INTEGER PRIMARY KEY, auditId TEXT, approvalId TEXT, grantId TEXT, clientId TEXT,
@@ -125,17 +139,19 @@ export class OperationStore {
       }
       const { auth, tool } = input;
       let argsHash = null;
+      let outcome = code;
       if (tool && input.args) {
-        try { argsHash = hash(canonicalJSON([tool, input.args])); } catch {}
+        try { argsHash = hash(canonicalJSON([tool, input.args])); }
+        catch { outcome = code + ":args_hash_unavailable"; }
       }
-      this.#audit({ ...row, approvalId: input.approvalId ?? row?.approvalId, grantId: auth?.grantId, clientId: auth?.clientId, tool, argsHash }, code);
-    } catch { deny("operation_store_unavailable"); }
+      this.#audit({ ...row, approvalId: input.approvalId ?? row?.approvalId, grantId: auth?.grantId, clientId: auth?.clientId, tool, argsHash }, outcome);
+    } catch (error) { deny(storeErrorCode(error)); }
   }
 
   #guard(input, action) {
     try { return this.#transaction(action); }
     catch (err) {
-      const code = err instanceof OperationError ? err.code : "operation_store_unavailable";
+      const code = storeErrorCode(err);
       this.recordDenial(input, code);
       deny(code);
     }
@@ -176,6 +192,14 @@ export class OperationStore {
         if (old.state === "declined") deny("approval_declined");
         if (["pending", "approved"].includes(old.state) && old.expiresAt > now) return this.#prepared({ ...old, summary: desc.summary });
       }
+      // Count every issued card, even one already consumed or declined. Idempotent
+      // lookups above never spend a new slot. BEGIN IMMEDIATE serializes this with INSERT.
+      const issued = this.#db.prepare(`SELECT count(*) AS total,
+        count(CASE WHEN grantId=? THEN 1 END) AS personal
+        FROM approvals WHERE issuedAt>?`).get(desc.grantId, now - 60000);
+      if (issued.personal >= this.#issuanceGrantLimit || issued.total >= this.#issuanceGlobalLimit) {
+        deny("approval_issue_rate_limited");
+      }
       this.#db.prepare("UPDATE approvals SET state='expired',summary=NULL WHERE state IN ('pending','approved') AND expiresAt<=?").run(now);
       const pending = this.#db.prepare(`SELECT count(*) AS total, count(CASE WHEN grantId=? THEN 1 END) AS personal
         FROM approvals WHERE state IN ('pending','approved')`).get(desc.grantId);
@@ -212,8 +236,8 @@ export class OperationStore {
         return { approvalId, state };
       });
     } catch (err) {
-      const code = err instanceof OperationError ? err.code : "operation_store_unavailable";
-      try { this.#audit(this.#row(approvalId) ?? { approvalId }, code); } catch { deny("operation_store_unavailable"); }
+      const code = storeErrorCode(err);
+      try { this.#audit(this.#row(approvalId) ?? { approvalId }, code); } catch (error) { deny(storeErrorCode(error)); }
       deny(code);
     }
   }
@@ -246,6 +270,18 @@ export class OperationStore {
     return { approvalId: row.approvalId, args: JSON.parse(desc.normalized) };
   }
 
+  // Once the external action has run, reporting a generic storage error could
+  // induce another submission. Keep the phase-specific code even if audit is down.
+  #saveAfterDispatch(input, failureCode, save) {
+    try {
+      return this.#transaction(save);
+    } catch (error) {
+      try { this.recordDenial(input, failureCode); }
+      catch (auditError) { throw new OperationError(failureCode, { cause: auditError }); }
+      throw new OperationError(failureCode, { cause: error });
+    }
+  }
+
   async execute(input, action) {
     const claim = this.#guard(input, () => this.#claim(input));
     if (claim.cached) return claim.result;
@@ -253,15 +289,16 @@ export class OperationStore {
     try {
       result = await action(claim.args);
     } catch {
-      this.#guard(input, () => {
+      this.#saveAfterDispatch(input, "operation_outcome_uncertain", () => {
         this.#db.prepare("UPDATE approvals SET state='uncertain' WHERE approvalId=?").run(claim.approvalId);
         this.#audit(this.#row(claim.approvalId), "execution_uncertain");
       });
       deny("operation_outcome_uncertain");
     }
-    return this.#guard(input, () => {
+    return this.#saveAfterDispatch(input, "operation_result_unrecorded", () => {
       const encoded = JSON.stringify(result);
-      this.#db.prepare("UPDATE approvals SET state='completed',result=? WHERE approvalId=? AND state='executing'").run(encoded, claim.approvalId);
+      const saved = this.#db.prepare("UPDATE approvals SET state='completed',result=? WHERE approvalId=? AND state='executing'").run(encoded, claim.approvalId);
+      if (saved.changes !== 1) deny("operation_result_unrecorded");
       this.#audit(this.#row(claim.approvalId), result?.isError ? "executed_error" : "executed");
       return JSON.parse(encoded);
     });
