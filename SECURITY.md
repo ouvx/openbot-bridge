@@ -58,6 +58,8 @@ git log -p --all | grep -nE '/(home|Users)/|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[a
 
 過去に消した行も履歴には残ります。履歴の書き換えは公開後の取得側にも影響するため、公開前に判断してください。あわせて、`.gitignore` の対象外にある一時物(テスト用の `node_modules` symlink など)が残っていないことを `git status --porcelain -uall` で確認します。
 
+テストの fixture には、形だけを模した明白なダミー(`sk-test-` で始まる文字列、`example.invalid`・`example.com` の宛先)が含まれます。GitHub の秘密スキャンや第三者ツールがこれらを検出しても、実在の資格情報ではありません。
+
 ## 配布の対象
 
 OpenBot Bridge は OpenAI の承認・提携を受けていない非公式プロジェクトです。ChatGPT App Directory への掲載は対象外です。
