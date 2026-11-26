@@ -34,21 +34,15 @@ export function loadConfig(env = process.env, overrides = {}) {
     readOnly: !["0", "false"].includes(env.BRIDGE_READ_ONLY),
     extendedTools: env.BRIDGE_EXTENDED_TOOLS === "1",
     events: env.BRIDGE_EVENTS === "1" || env.BRIDGE_EVENTS === "true",
-    limits: {
-      requestsPerMinute: Number(env.BRIDGE_RPM || 90),
-      writesPerMinute: Number(env.BRIDGE_WRITES_PER_MINUTE || 12),
-      maxMessageChars: Number(env.BRIDGE_MAX_MESSAGE_CHARS || 12000),
-      maxToolResultChars: Number(env.BRIDGE_MAX_RESULT_CHARS || 40000),
-      artifactBytes: Number(env.BRIDGE_MAX_ARTIFACT_BYTES || 256 * 1024),
-      waitSecondsMax: 25,
-    },
+    approvalTtlSeconds: Number(env.BRIDGE_APPROVAL_TTL_SECONDS ?? 120),
     logLevel: env.BRIDGE_LOG_LEVEL || "info",
     sharedDir: env.OPENBOT_SHARED_DIR || join(home, "OpenBot", "Shared"),
     ...overrides,
     openbot: { ...{ dbPath: env.OPENBOT_DB || join(openbotConfig, "openbot.db"), automationDir: env.OPENBOT_AUTOMATION_DIR || join(openbotConfig, "automation"), configDir: openbotConfig }, ...(overrides.openbot ?? {}) },
     limits: {
       requestsPerMinute: Number(env.BRIDGE_RPM || 90),
-      writesPerMinute: Number(env.BRIDGE_WRITES_PER_MINUTE || 12),
+      writesPerMinute: Number(env.BRIDGE_WRITES_PER_MINUTE ?? 12),
+      globalWritesPerMinute: Number(env.BRIDGE_GLOBAL_WRITES_PER_MINUTE ?? 60),
       maxMessageChars: Number(env.BRIDGE_MAX_MESSAGE_CHARS || 12000),
       maxToolResultChars: Number(env.BRIDGE_MAX_RESULT_CHARS || 40000),
       artifactBytes: Number(env.BRIDGE_MAX_ARTIFACT_BYTES || 256 * 1024),
@@ -70,6 +64,10 @@ export function loadConfig(env = process.env, overrides = {}) {
   if (!Number.isSafeInteger(config.limits.artifactBytes) || config.limits.artifactBytes < 1) {
     throw new Error("BRIDGE_MAX_ARTIFACT_BYTES must be a positive byte count.");
   }
+  for (const value of [config.approvalTtlSeconds, config.limits.writesPerMinute, config.limits.globalWritesPerMinute, config.limits.requestsPerMinute]) {
+    if (!Number.isSafeInteger(value) || value < 1) throw new Error("Approval lifetime and rate limits must be positive integers.");
+  }
+  if (config.approvalTtlSeconds > 3600) throw new Error("Approval lifetime exceeds one hour.");
   if (config.events) throw new Error("Events delivery is disabled in this release.");
   if (config.publicUrl && !validOrigin(config.publicUrl)) {
     throw new Error("BRIDGE_PUBLIC_URL must be an HTTPS origin or a loopback HTTP origin.");

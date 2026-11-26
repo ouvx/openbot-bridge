@@ -61,6 +61,7 @@ export class AutomationClient {
     try {
       response = await fetch(`${connection.url}${path}`, {
         method,
+        redirect: "error",
         headers: {
           authorization: `Bearer ${connection.token}`,
           ...(body === undefined ? {} : { "content-type": "application/json" }),
@@ -69,7 +70,7 @@ export class AutomationClient {
         signal: AbortSignal.timeout(this.#timeoutMs),
       });
     } catch (error) {
-      if (attempt === 0) {
+      if (method === "GET" && attempt === 0) {
         this.#cached = null; // The app may have restarted with a new port.
         return this.#fetch(method, path, body, 1);
       }
@@ -83,7 +84,7 @@ export class AutomationClient {
       payload = null;
     }
     if (response.ok) return payload;
-    if (response.status === 401 && attempt === 0) {
+    if (response.status === 401 && method === "GET" && attempt === 0) {
       this.#cached = null;
       return this.#fetch(method, path, body, 1);
     }

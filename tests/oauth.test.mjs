@@ -18,14 +18,15 @@ async function fixture(t) {
   const server = new OAuthServer(config);
   await server.init();
   const { client_id: clientId } = await server.register({ redirect_uris: [redirectUri] });
-  async function authorization() {
+  async function authorization({ includeRedirect = true } = {}) {
     const verifier = randomBytes(40).toString("base64url");
     const query = form({ response_type: "code", client_id: clientId, redirect_uri: redirectUri,
       resource, code_challenge_method: "S256", code_challenge: createHash("sha256").update(verifier).digest("base64url") });
+    if (!includeRedirect) query.delete("redirect_uri");
     const callback = await server.approve(server.authorizeRequest(query), passcode);
     const code = new URL(callback).searchParams.get("code");
     const params = form({ grant_type: "authorization_code", code, code_verifier: verifier, client_id: clientId, redirect_uri: redirectUri, resource });
-    return { params, query };
+    return { params, query, callback };
   }
   async function issue() {
     const { params } = await authorization();
@@ -87,10 +88,10 @@ test("OAuth individually revokes the grant, including rotated tokens, while anot
   assert.equal(server.verify(second.bearer, resource).ok, true);
 });
 
-test("OAuth rejects refresh client mismatch and missing or changed redirect bindings", async (t) => {
+test("OAuth refresh binds the client, resource and any supplied redirect URI", async (t) => {
   const { server, issue } = await fixture(t);
   const { refresh } = await issue();
-  for (const [name, value] of [["client_id", "other-client"], ["redirect_uri", "https://other.example/callback"], ["client_id", null], ["redirect_uri", null], ["resource", null]]) {
+  for (const [name, value] of [["client_id", "other-client"], ["redirect_uri", "https://other.example/callback"], ["client_id", null], ["resource", null]]) {
     const params = new URLSearchParams(refresh);
     if (value === null) params.delete(name);
     else params.set(name, value);
@@ -127,4 +128,51 @@ test("OAuth refuses a corrupt store and preserves its contents", async (t) => {
   const server = new OAuthServer({ dataDir: dir, publicUrl: resource, adminSecret: randomBytes(32).toString("hex") });
   await assert.rejects(server.init());
   assert.equal(await readFile(store, "utf8"), "{");
+});
+
+test("code exchange requires the original redirect when explicitly requested", async t => {
+  const { server, authorization } = await fixture(t);
+  const { params } = await authorization();
+  params.delete("redirect_uri");
+  await assert.rejects(server.exchange(params), { code: "invalid_grant" });
+  params.set("redirect_uri", "https://other.example/callback");
+  await assert.rejects(server.exchange(params), { code: "invalid_grant" });
+  params.set("redirect_uri", redirectUri);
+  assert.ok((await server.exchange(params)).access_token);
+});
+
+test("authorization with a single registered redirect accepts omission through code exchange", async t => {
+  const { server, authorization } = await fixture(t);
+  const { params, callback } = await authorization({ includeRedirect: false });
+  assert.equal(callback.split("?")[0], redirectUri);
+  params.delete("redirect_uri");
+  assert.ok((await server.exchange(params)).access_token);
+});
+
+test("authorization with multiple registered redirects rejects an omitted redirect", async t => {
+  const { server, authorization } = await fixture(t);
+  const { query } = await authorization();
+  const client = await server.register({ redirect_uris: [redirectUri, "https://another.example/callback"] });
+  query.set("client_id", client.client_id);
+  query.delete("redirect_uri");
+  assert.throws(() => server.authorizeRequest(query), { code: "invalid_request" });
+});
+
+test("independent concurrent OAuth refreshes persist both rotations across reload", async t => {
+  const { server, config, issue } = await fixture(t);
+  const a = await issue();
+  const b = await issue();
+  a.refresh.delete("redirect_uri");
+  b.refresh.delete("redirect_uri");
+  const renewed = await Promise.all([server.exchange(a.refresh), server.exchange(b.refresh)]);
+  const reopened = new OAuthServer(config);
+  await reopened.init();
+  for (const [i, grant] of [a, b].entries()) {
+    await assert.rejects(reopened.exchange(grant.refresh), { code: "invalid_grant" });
+    const replacement = renewed[i];
+    assert.equal(reopened.verify("Bearer " + replacement.access_token).ok, true);
+    const next = new URLSearchParams(grant.refresh);
+    next.set("refresh_token", replacement.refresh_token);
+    assert.ok((await reopened.exchange(next)).access_token);
+  }
 });

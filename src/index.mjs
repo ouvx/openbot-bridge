@@ -7,6 +7,7 @@ import { loadConfig } from "./config.mjs";
 import { createAuditLog, createLogger, maskSecrets } from "./log.mjs";
 import { OpenBotDb } from "./openbot/db.mjs";
 import { AutomationClient } from "./openbot/automation.mjs";
+import { OperationStore } from "./operations.mjs";
 import { JobStore } from "./jobs.mjs";
 import { OAuthError, OAuthServer, SCOPES } from "./auth.mjs";
 import { registerTools } from "./tools.mjs";
@@ -26,6 +27,7 @@ export async function startBridge(overrides = {}) {
   if (config.extendedTools) await jobs.init();
 
   let oauth;
+  let operations;
   const eventsEnabled = config.events === true;
   const events = new EventBus({
     dataDir: config.dataDir, logger, jobs, db,
@@ -33,7 +35,7 @@ export async function startBridge(overrides = {}) {
   });
   if (eventsEnabled) await events.init();
 
-  const rate = new RateLimiter(config.limits.requestsPerMinute, config.limits.writesPerMinute);
+  const rate = new RequestLimiter(config.limits.requestsPerMinute);
   const sessions = new Map();
 
   const buildSession = (auth) => {
@@ -49,6 +51,7 @@ export async function startBridge(overrides = {}) {
       dashboardUri: DASHBOARD_URI,
       renderDashboard,
       currentAuth: () => auth,
+      operations,
     };
     const server = new McpServer(
       { name: "openbot-bridge", version: VERSION },
@@ -56,6 +59,8 @@ export async function startBridge(overrides = {}) {
         instructions: [
           "OpenBot Bridge connects this ChatGPT conversation to a running OpenBot desktop app on the user's computer.",
           "Each OpenBot agent has its own runtime, provider, model, tools and session; discover them with list_agents instead of assuming names or models.",
+          "Write calls first return an approval ID without executing. Ask the local operator to review this ID in the separate approval card. Never approve a request yourself.",
+          "After human approval, repeat exactly the same tool and arguments with approval_id. For a lost successful response, retry the same arguments without approval_id to retrieve the saved result.",
           "Use only the tools advertised by this session.",
           "Tool calls that start work return at once with a task id; never wait inside one call for a long job.",
           "If a task reports needs_person, a question or approval is waiting inside the OpenBot app; tell the user.",
@@ -99,6 +104,7 @@ export async function startBridge(overrides = {}) {
       return;
     }
 
+    // MCP Streamable HTTP validates Origin when present. Host and MCP Bearer checks also apply to origin-less clients.
     if (req.headers.origin !== undefined && !config.allowedOrigins.includes(req.headers.origin)) {
       sendJson(res, 403, { error: "This origin is not allowed." });
       return;
@@ -173,7 +179,7 @@ export async function startBridge(overrides = {}) {
           audit({ event: "unauthorized", ip: req.socket.remoteAddress ?? null, reason: auth.reason });
           return;
         }
-        const limited = rate.take(req.headers.authorization, "read");
+        const limited = rate.take(auth.grantId);
         if (!limited.ok) {
           res.writeHead(429, { "retry-after": String(limited.retryAfterSeconds), "content-type": "application/json" });
           res.end(JSON.stringify({ error: "rate_limited" }));
@@ -225,6 +231,10 @@ export async function startBridge(overrides = {}) {
       allowedAgentIds: config.allowedAgents, clientAgentIds: config.clientAgentIds,
     });
     await server.init();
+    if (config.extendedTools) operations = new OperationStore({
+      dataDir: config.dataDir, ttlSeconds: config.approvalTtlSeconds,
+      subjectLimit: config.limits.writesPerMinute, globalLimit: config.limits.globalWritesPerMinute,
+    });
     oauth = server;
   } catch (error) {
     clearInterval(sweeper);
@@ -249,12 +259,14 @@ export async function startBridge(overrides = {}) {
     oauth,
     logger,
     sessions,
+    operations,
     async stop() {
       clearInterval(sweeper);
       events.stop();
       for (const session of sessions.values()) await session.transport.close().catch(() => {});
       sessions.clear();
       await new Promise((resolvePromise) => httpServer.close(resolvePromise));
+      operations?.close();
       db.close();
     },
   };
@@ -341,19 +353,14 @@ function registerEventHandlers(server, events, auth) {
   });
 }
 
-class RateLimiter {
-  #readLimit;
-  #writeLimit;
+// Transport request budget. Write execution has a separate transactional budget.
+class RequestLimiter {
+  #limit;
   #buckets = new Map();
 
-  constructor(readLimit, writeLimit) {
-    this.#readLimit = readLimit;
-    this.#writeLimit = writeLimit;
-  }
+  constructor(limit) { this.#limit = limit; }
 
-  take(authorization, kind) {
-    const key = `${authorization ?? "anon"}|${kind}`;
-    const limit = kind === "write" ? this.#writeLimit : this.#readLimit;
+  take(key) {
     const now = Date.now();
     const bucket = this.#buckets.get(key) ?? { count: 0, resetAt: now + 60_000 };
     if (now > bucket.resetAt) {
@@ -363,7 +370,7 @@ class RateLimiter {
     bucket.count += 1;
     this.#buckets.set(key, bucket);
     if (this.#buckets.size > 5000) this.#buckets.clear();
-    return { ok: bucket.count <= limit, retryAfterSeconds: Math.max(1, Math.ceil((bucket.resetAt - now) / 1000)) };
+    return { ok: bucket.count <= this.#limit, retryAfterSeconds: Math.max(1, Math.ceil((bucket.resetAt - now) / 1000)) };
   }
 }
 
@@ -471,7 +478,7 @@ button{margin-top:14px;width:100%;padding:11px;border-radius:8px;border:0;backgr
 <form method="post" action="/oauth/authorize/approve">
 <input type="hidden" name="response_type" value="code">
 <input type="hidden" name="client_id" value="${escapeHtml(request.clientId)}">
-<input type="hidden" name="redirect_uri" value="${escapeHtml(request.redirectUri)}">
+${request.redirectUriProvided ? `<input type="hidden" name="redirect_uri" value="${escapeHtml(request.redirectUri)}">` : ""}
 <input type="hidden" name="state" value="${escapeHtml(request.state)}">
 <input type="hidden" name="code_challenge" value="${escapeHtml(request.codeChallenge)}">
 <input type="hidden" name="code_challenge_method" value="S256">

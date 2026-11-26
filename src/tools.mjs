@@ -2,6 +2,7 @@ import { z } from "zod";
 import { readArtifact, listArtifacts } from "./artifacts.mjs";
 import { systemSnapshot } from "./openbot/system.mjs";
 import { isAgentAllowed } from "./config.mjs";
+import { OperationError, canonicalJSON } from "./operations.mjs";
 import { isEnded, belongsToGrant } from "./jobs.mjs";
 import { maskSecrets, truncate } from "./log.mjs";
 
@@ -30,11 +31,9 @@ export function registerTools(server, ctx) {
 
   const withScope = (scope, name, handler) => async (args, extra) => {
     const auth = ctx.currentAuth?.();
+    if (scope !== "openbot.read") return guardedWrite(scope, name, args, handler, extra, auth);
     if (!oauth.hasScope(auth, scope)) {
       return fail(`This connection is missing the ${scope} scope. Reconnect the plugin in ChatGPT to grant it.`);
-    }
-    if (scope !== "openbot.read" && config.readOnly) {
-      return fail("The bridge runs in read-only mode (BRIDGE_READ_ONLY=1).");
     }
     audit({
       tool: name,
@@ -499,13 +498,64 @@ export function registerTools(server, ctx) {
 
   // --------------------------------------------------------------- writes ---
 
-  const dispatch = async ({ agentId, kind, title, prompt, idempotencyKey }) => {
-    if (idempotencyKey) {
-      const existing = jobs.findByIdempotencyKey(idempotencyKey, ctx.currentAuth());
-      if (existing && existing.agentId !== agentId) throw new Error("That idempotency key cannot be reused for a different target.");
-      if (existing) return existing;
+  const approvalFields = {
+    approval_id: z.string().uuid().optional().describe("Single-use ID after the operator approves the local card. Omit to request a card or retrieve a completed result."),
+    idempotency_key: z.string().trim().min(1).max(120).optional().describe("Stable key for the same operation. Change it only for an intentionally new action."),
+  };
+
+  // The same entry point guards all write/admin tools, including direct SDK calls.
+  async function guardedWrite(scope, tool, raw, handler, extra, auth) {
+    const { approval_id: approvalId, idempotency_key: idempotencyKey, ...args } = raw;
+    const input = { auth, tool, args, targets: [], approvalId, idempotencyKey };
+    const refuse = (code, message) => {
+      ctx.operations?.recordDenial(input, code);
+      if (!ctx.operations) audit({ event: code, tool, clientId: auth?.clientId, grantId: auth?.grantId });
+      return fail(message, { code });
+    };
+    try {
+      if (!oauth.hasScope(auth, scope)) return refuse("insufficient_scope", "The required scope is missing.");
+      if (config.readOnly) return refuse("read_only", "The bridge runs in read-only mode.");
+      if (!ctx.operations) return refuse("operation_store_unavailable", "The approval store is unavailable.");
+      const effective = JSON.parse(canonicalJSON(args));
+      try {
+        if (Object.hasOwn(effective, "agent_id")) {
+          // Bind a name to an immutable ID before preparing or looking up a result.
+          effective.agent_id = resolveAgent(effective.agent_id).id;
+          input.targets = [effective.agent_id];
+        } else {
+          input.targets = [ownedJob(effective.task_id).agentId];
+        }
+      } catch {
+        return refuse("target_denied", "The target is unavailable for this grant.");
+      }
+      input.args = effective;
+      if (["message", "task", "feedback"].some(key => Object.hasOwn(effective, key) && !effective[key])) {
+        return refuse("invalid_arguments", "An empty instruction cannot be approved.");
+      }
+      if (!approvalId) {
+        const prepared = ctx.operations.prepare(input);
+        if (prepared.cached) return prepared.result;
+        return fail("Local human approval required. Review the card before repeating this call.", {
+          code: "approval_required", approval_id: prepared.approvalId, expires_at: new Date(prepared.expiresAt).toISOString(),
+        });
+      }
+      return await ctx.operations.execute(input, normalized => handler(normalized, extra));
+    } catch (error) {
+      const code = error instanceof OperationError ? error.code : "operation_store_unavailable";
+      logger.warn("Write refused or outcome unconfirmed", { tool, code, grantId: auth?.grantId });
+      return fail(code, { code });
     }
-    const job = await jobs.create({ agentId, kind, title, prompt, idempotencyKey, owner: ctx.currentAuth() });
+  }
+
+  // An approved ID must never be interpreted as a name during dispatch.
+  const exactWriteAgent = id => {
+    const agent = db.listAgents().find(candidate => candidate.id === id);
+    if (!agent || !agentAllowed(id)) throw new Error("Approved target unavailable.");
+    return agent;
+  };
+
+  const dispatch = async ({ agentId, kind, title, prompt }) => {
+    const job = await jobs.create({ agentId, kind, title, prompt, owner: ctx.currentAuth() });
     try {
       return await jobs.dispatch(job);
     } catch (error) {
@@ -524,23 +574,22 @@ export function registerTools(server, ctx) {
       description:
         "Send a message to one OpenBot agent in its current session and return a task id at once. The agent works with its own runtime, model and tools; poll with get_task. Keep follow-ups to the same agent so its context continues.",
       inputSchema: {
+        ...approvalFields,
         agent_id: z.string().describe("Agent id or exact name from list_agents."),
         message: z.string().min(1).describe("The text to send."),
         title: z.string().max(120).optional().describe("Short label for the task list."),
-        idempotency_key: z.string().max(120).optional().describe("Reuse to avoid sending the same message twice."),
         wait_seconds: z.number().min(0).max(25).optional().describe("Poll briefly so quick replies can finish in this call."),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
-    withScope("openbot.write", "send_message", async ({ agent_id, message, title, idempotency_key, wait_seconds }) => {
-      const agent = requireAllowed(resolveAgent(agent_id));
+    withScope("openbot.write", "send_message", async ({ agent_id, message, title, wait_seconds }) => {
+      const agent = exactWriteAgent(agent_id);
       if (message.length > config.limits.maxMessageChars) return fail(`The message is longer than ${config.limits.maxMessageChars} characters.`);
       const job = await dispatch({
         agentId: agent.id,
         kind: "message",
         title,
         prompt: message,
-        idempotencyKey: idempotency_key ?? null,
       });
       const current = wait_seconds ? await jobs.waitFor(job, wait_seconds) : job;
       return reply(
@@ -557,19 +606,19 @@ export function registerTools(server, ctx) {
       description:
         "Delegate a complete task to one agent. The bridge frames the request with the goal, context, constraints and the definition of done, then returns a task id immediately. Use send_message instead for short conversation, and send_feedback to correct a finished task.",
       inputSchema: {
+        ...approvalFields,
         agent_id: z.string().describe("Agent id or exact name."),
         task: z.string().min(1).describe("What the agent must do."),
         context: z.string().optional().describe("Background the agent cannot see, such as the current ChatGPT discussion."),
         constraints: z.string().optional().describe("Limits: files to avoid, no network, no push, and so on."),
         definition_of_done: z.string().optional().describe("How the result will be judged."),
         title: z.string().max(120).optional(),
-        idempotency_key: z.string().max(120).optional(),
         wait_seconds: z.number().min(0).max(25).optional(),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
-    withScope("openbot.write", "delegate_task", async ({ agent_id, task, context, constraints, definition_of_done, title, idempotency_key, wait_seconds }) => {
-      const agent = requireAllowed(resolveAgent(agent_id));
+    withScope("openbot.write", "delegate_task", async ({ agent_id, task, context, constraints, definition_of_done, title, wait_seconds }) => {
+      const agent = exactWriteAgent(agent_id);
       const prompt = [
         "【ChatGPTからの依頼】",
         `目的: ${task}`,
@@ -586,7 +635,6 @@ export function registerTools(server, ctx) {
         kind: "task",
         title: title ?? task.slice(0, 80),
         prompt,
-        idempotencyKey: idempotency_key ?? null,
       });
       const current = wait_seconds ? await jobs.waitFor(job, wait_seconds) : job;
       return reply(
@@ -603,6 +651,7 @@ export function registerTools(server, ctx) {
       description:
         "Send review notes about a task back to the agent that did it. The agent keeps its session, so it can revise the same work. Pass task_id; the feedback is sent as a new task that references the original.",
       inputSchema: {
+        ...approvalFields,
         task_id: z.string().describe("The task being corrected."),
         feedback: z.string().min(1).describe("What is wrong and what to change."),
         wait_seconds: z.number().min(0).max(25).optional(),
@@ -620,7 +669,7 @@ export function registerTools(server, ctx) {
         "",
         "前回の続きとして、同じセッションの文脈で直してください。直したこと・確認したこと・未確認のことを短く返してください。",
       ].join("\n");
-      const job = await dispatch({ agentId: agent.id, kind: "feedback", title: `修正: ${original.title}`, prompt, idempotencyKey: null });
+      const job = await dispatch({ agentId: agent.id, kind: "feedback", title: `修正: ${original.title}`, prompt });
       const current = wait_seconds ? await jobs.waitFor(job, wait_seconds) : job;
       return reply(
         { ...jobSummary(current), agent_name: agent.name ?? null, original_task_id: original.id },
@@ -636,6 +685,7 @@ export function registerTools(server, ctx) {
       description:
         "Stop tracking a task and mark it cancelled. OpenBot cannot interrupt a turn that is already running from the automation API, so tell the user the agent may still finish its current step inside OpenBot.",
       inputSchema: {
+        ...approvalFields,
         task_id: z.string(),
         reason: z.string().max(300).optional(),
       },
@@ -659,13 +709,14 @@ export function registerTools(server, ctx) {
       description:
         "Start a fresh chat with one agent so old context is not carried into a new request. The agent's instructions, model and files stay unchanged. This changes OpenBot state, so confirm with the user first.",
       inputSchema: {
+        ...approvalFields,
         agent_id: z.string().describe("Agent id or exact name."),
         confirm: z.literal(true).describe("Must be true: this clears the agent's current conversation context."),
       },
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
     },
     withScope("openbot.admin", "start_new_session", async ({ agent_id }) => {
-      const agent = requireAllowed(resolveAgent(agent_id));
+      const agent = exactWriteAgent(agent_id);
       await automation.newChat(agent.id);
       return reply(
         { agent_id: agent.id, agent_name: agent.name, cleared: true },

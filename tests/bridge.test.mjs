@@ -167,7 +167,7 @@ test("bridge: OAuth, tools, and task lifecycle against a fake OpenBot", async (t
     allowedAgents: ["agent-1", "agent-2"],
     extendedTools: true,
     readOnly: false,
-    limits: { requestsPerMinute: 200, writesPerMinute: 50, maxMessageChars: 12000, maxToolResultChars: 40000, artifactBytes: 200000, waitSecondsMax: 25 },
+    limits: { requestsPerMinute: 200, writesPerMinute: 1, maxMessageChars: 12000, maxToolResultChars: 40000, artifactBytes: 200000, waitSecondsMax: 25 },
     logLevel: "error",
   });
   t.after(async () => {
@@ -269,19 +269,33 @@ test("bridge: OAuth, tools, and task lifecycle against a fake OpenBot", async (t
   assert.equal(agents.structuredContent.count, 2);
   assert.equal(agents.structuredContent.agents[0].provider, "pi");
 
-  const delegated = await client.callTool({
-    name: "delegate_task",
-    arguments: { agent_id: "Example Builder", task: "README を直す", definition_of_done: "差分と確認結果が返る", idempotency_key: "readme-fix-1" },
-  });
+  const args = { agent_id: "Example Builder", task: "README を直す", definition_of_done: "差分と確認結果が返る", idempotency_key: "readme-fix-1" };
+  const delegate = (arguments_) => client.callTool({ name: "delegate_task", arguments: arguments_ });
+  async function approve(args) {
+    const proposal = await delegate(args);
+    assert.equal(proposal.structuredContent.code, "approval_required");
+    const id = proposal.structuredContent.approval_id;
+    bridge.operations.decide(id, bridge.operations.card(id).summaryHash, true);
+    return id;
+  }
+  const approvalId = await approve(args);
+  assert.equal(automation.messages.length, 0);
+  const altered = await delegate({ ...args, task: "別の依頼", approval_id: approvalId });
+  assert.equal(altered.structuredContent.code, "approval_arguments_mismatch");
+  assert.equal(automation.messages.length, 0);
+  const delegated = await delegate({ ...args, approval_id: approvalId });
   const taskId = delegated.structuredContent.task_id;
   assert.ok(taskId);
   assert.equal(automation.messages.length, 1);
   assert.match(automation.messages[0].clientMessageId, /^job_/);
-
-  // The same idempotency key never sends twice.
-  const again = await client.callTool({ name: "delegate_task", arguments: { agent_id: "agent-1", task: "README を直す", idempotency_key: "readme-fix-1" } });
-  assert.equal(again.structuredContent.task_id, taskId);
-  assert.equal(automation.messages.length, 1);
+  const again = await delegate(args);
+  assert.deepEqual(again, delegated);
+  const other = { ...args, idempotency_key: "second", task: "別の依頼" };
+  const secondId = await approve(other);
+  const before = automation.messages.length;
+  const limited = await delegate({ ...other, approval_id: secondId });
+  assert.equal(limited.structuredContent.code, "write_rate_limited");
+  assert.equal(automation.messages.length - before, 0);
 
   const finished = await client.callTool({ name: "get_task", arguments: { task_id: taskId, wait_seconds: 2 } });
   assert.equal(finished.structuredContent.status, "completed");

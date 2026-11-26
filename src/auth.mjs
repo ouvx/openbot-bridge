@@ -180,7 +180,10 @@ export class OAuthServer {
     const clientId = one(query, "client_id");
     const client = this.client(clientId);
     if (!client) throw new OAuthError("invalid_client", "Unknown client.");
-    const redirectUri = one(query, "redirect_uri");
+    // RFC 6749 §3.1.2.3: omission is unambiguous only for a single registered URI.
+    const redirectUriProvided = query.has("redirect_uri");
+    const redirectUri = redirectUriProvided ? one(query, "redirect_uri") :
+      (client.redirect_uris.length === 1 ? client.redirect_uris[0] : undefined);
     if (!validRedirect(redirectUri) || !client.redirect_uris.includes(redirectUri)) {
       throw new OAuthError("invalid_request", "Invalid redirect_uri.");
     }
@@ -191,7 +194,7 @@ export class OAuthServer {
     const resource = this.#resource(query);
     const scopes = [...new Set((query.has("scope") ? one(query, "scope") : "openbot.read").split(/\s+/).filter(Boolean))];
     if (!scopes.length || !scopes.every(scope => SCOPES.includes(scope))) throw new OAuthError("invalid_scope", "Invalid scope.");
-    return { client, clientId, redirectUri, state: query.get("state") ?? "", resource, codeChallenge: challenge, scopes };
+    return { client, clientId, redirectUri, redirectUriProvided, state: query.get("state") ?? "", resource, codeChallenge: challenge, scopes };
   }
 
   async approve(request, passcode) {
@@ -200,7 +203,8 @@ export class OAuthServer {
     const code = `code_${token(24)}`;
     await this.#change(state => {
       state.codes[sha256(code)] = {
-        clientId: request.clientId, redirectUri: request.redirectUri, codeChallenge: request.codeChallenge,
+        clientId: request.clientId, redirectUri: request.redirectUri, redirectUriProvided: request.redirectUriProvided,
+        codeChallenge: request.codeChallenge,
         scopes: request.scopes, resource: request.resource, expiresAt: Date.now() + CODE_TTL_MS,
         grantId: token(24), allowedAgentIds: [...this.#agentsFor(request.clientId)],
       };
@@ -246,14 +250,22 @@ export class OAuthServer {
     }
     const resource = this.#resource(params);
     const clientId = one(params, "client_id");
-    const redirectUri = one(params, "redirect_uri");
+    const redirectUri = params.has("redirect_uri") ? one(params, "redirect_uri") : null;
     const isCode = type === "authorization_code";
     const key = sha256(one(params, isCode ? "code" : "refresh_token"));
     return this.#change(state => {
       const group = isCode ? state.codes : state.refresh;
       const entry = group[key];
-      if (!this.#bound(entry) || entry.resource !== resource || entry.clientId !== clientId || entry.redirectUri !== redirectUri) {
+      if (!this.#bound(entry) || entry.resource !== resource || entry.clientId !== clientId) {
         throw new OAuthError("invalid_grant", "Invalid grant or binding.");
+      }
+      // RFC 6749 §4.1.3 requires the same URI during code exchange when it was
+      // sent during authorization. Codes written before the flag existed all
+      // required an explicit redirect. §6 does not require a URI on refresh.
+      // MCP's resource indicator and the original client binding apply to both.
+      if ((redirectUri !== null && redirectUri !== entry.redirectUri) ||
+          (isCode && entry.redirectUriProvided !== false && redirectUri === null)) {
+        throw new OAuthError("invalid_grant", "Invalid redirect_uri binding.");
       }
       if (isCode) {
         const verifier = one(params, "code_verifier");

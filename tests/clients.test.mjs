@@ -26,8 +26,7 @@ async function fixture(t) {
   return { root, passcode, bridge };
 }
 
-test("SDK completes discovery, registration, S256 consent and Streamable HTTP; revoked access returns 401", async t => {
-  const { bridge, passcode } = await fixture(t);
+async function authorizeClient(bridge, passcode) {
   const serverUrl = new URL(bridge.mcpUrl);
   const redirect = "http://127.0.0.1/callback";
   let registration, verifier, authorizationUrl, tokens;
@@ -41,6 +40,7 @@ test("SDK completes discovery, registration, S256 consent and Streamable HTTP; r
   };
   const options = { serverUrl, scope: "openbot.read" };
   assert.equal(await auth(provider, options), "REDIRECT");
+  assert.equal(authorizationUrl.searchParams.get("redirect_uri"), redirect);
   const params = new URLSearchParams(authorizationUrl.searchParams);
   params.set("passcode", passcode);
   const approval = await fetch(bridge.url + "/oauth/authorize/approve", {
@@ -50,24 +50,46 @@ test("SDK completes discovery, registration, S256 consent and Streamable HTTP; r
   const code = new URL(approval.headers.get("location")).searchParams.get("code");
   assert.equal(await auth(provider, { ...options, authorizationCode: code }), "AUTHORIZED");
 
+  return { provider, registration, tokens, serverUrl };
+}
+
+async function connectAndCheck(serverUrl, provider, origin) {
   const client = new Client({ name: "Test MCP client", version: "1.0" });
-  t.after(() => client.close());
-  await client.connect(new StreamableHTTPClientTransport(serverUrl, {
-    authProvider: provider, requestInit: { headers: { origin: "https://client.example" } },
-  }));
-  assert.deepEqual((await client.listTools()).tools.map(tool => tool.name).sort(), ["list_agents", "openbot_health"]);
-  assert.equal((await client.callTool({ name: "openbot_health", arguments: {} })).isError, undefined);
-  const metadata = await fetch(bridge.url + "/.well-known/oauth-authorization-server").then(r => r.json());
-  // The standard SDK omits redirect_uri when refreshing. This deployment requires it.
-  await assert.rejects(refreshAuthorization(new URL(bridge.url), {
-    metadata, clientInformation: registration, refreshToken: tokens.refresh_token, resource: bridge.url,
-  }), /redirect_uri/);
+  try {
+    await client.connect(new StreamableHTTPClientTransport(serverUrl, {
+      authProvider: provider, requestInit: { headers: origin ? { origin } : {} },
+    }));
+    assert.deepEqual((await client.listTools()).tools.map(tool => tool.name).sort(), ["list_agents", "openbot_health"]);
+    assert.equal((await client.callTool({ name: "openbot_health", arguments: {} })).isError, undefined);
+  } finally {
+    await client.close();
+  }
+}
+
+test("SDK discovery and S256 grant allow Streamable HTTP with matching Origin and without Origin", async t => {
+  const { bridge, passcode } = await fixture(t);
+  const { provider, serverUrl, tokens, registration } = await authorizeClient(bridge, passcode);
+  await connectAndCheck(serverUrl, provider, "https://client.example");
+  await connectAndCheck(serverUrl, provider);
   const revoked = await fetch(bridge.url + "/oauth/revoke", {
     method: "POST", body: new URLSearchParams({ token: tokens.access_token, client_id: registration.client_id }),
   });
   assert.equal(revoked.status, 200);
   const response = await fetch(serverUrl, { method: "POST", headers: { authorization: "Bearer " + tokens.access_token } });
   assert.equal(response.status, 401);
+});
+
+test("standard SDK refresh rotates tokens with no redirect_uri after explicit redirect consent", async t => {
+  const { bridge, passcode } = await fixture(t);
+  const { provider, serverUrl, registration, tokens } = await authorizeClient(bridge, passcode);
+  const metadata = await fetch(bridge.url + "/.well-known/oauth-authorization-server").then(r => r.json());
+  const request = { metadata, clientInformation: registration, refreshToken: tokens.refresh_token, resource: bridge.url };
+  const rotated = await refreshAuthorization(new URL(bridge.url), request);
+  assert.ok(rotated.access_token && rotated.access_token !== tokens.access_token);
+  assert.ok(rotated.refresh_token && rotated.refresh_token !== tokens.refresh_token);
+  await assert.rejects(refreshAuthorization(new URL(bridge.url), request));
+  provider.saveTokens(rotated);
+  await connectAndCheck(serverUrl, provider);
 });
 
 test("token CLI writes read-only credentials privately and warns on explicit elevation", async t => {
