@@ -554,8 +554,8 @@ export function registerTools(server, ctx) {
     return agent;
   };
 
-  const dispatch = async ({ agentId, kind, title, prompt }) => {
-    const job = await jobs.create({ agentId, kind, title, prompt, owner: ctx.currentAuth() });
+  const dispatch = async ({ agentId, kind, title, titleFromUser = false, prompt }) => {
+    const job = await jobs.create({ agentId, kind, title, titleFromUser, prompt, owner: ctx.currentAuth() });
     try {
       return await jobs.dispatch(job);
     } catch (error) {
@@ -589,6 +589,7 @@ export function registerTools(server, ctx) {
         agentId: agent.id,
         kind: "message",
         title,
+        titleFromUser: Boolean(title),
         prompt: message,
       });
       const current = wait_seconds ? await jobs.waitFor(job, wait_seconds) : job;
@@ -634,6 +635,7 @@ export function registerTools(server, ctx) {
         agentId: agent.id,
         kind: "task",
         title: title ?? task.slice(0, 80),
+        titleFromUser: Boolean(title),
         prompt,
       });
       const current = wait_seconds ? await jobs.waitFor(job, wait_seconds) : job;
@@ -669,7 +671,7 @@ export function registerTools(server, ctx) {
         "",
         "前回の続きとして、同じセッションの文脈で直してください。直したこと・確認したこと・未確認のことを短く返してください。",
       ].join("\n");
-      const job = await dispatch({ agentId: agent.id, kind: "feedback", title: `修正: ${original.title}`, prompt });
+      const job = await dispatch({ agentId: agent.id, kind: "feedback", title: `修正: ${original.title}`, titleFromUser: false, prompt });
       const current = wait_seconds ? await jobs.waitFor(job, wait_seconds) : job;
       return reply(
         { ...jobSummary(current), agent_name: agent.name ?? null, original_task_id: original.id },

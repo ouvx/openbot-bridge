@@ -1,9 +1,9 @@
-import { createHash, createHmac, randomUUID } from "node:crypto";
-import { readFileSync, statSync } from "node:fs";
+import { createHash, createHmac } from "node:crypto";
+import { chmodSync, closeSync, constants, fstatSync, openSync, readFileSync } from "node:fs";
 import { request as httpRequest } from "node:http";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { isPrivateAddress, postPinned, resolveCallback } from "./callback.mjs";
+import { postPinned, resolveCallback } from "./callback.mjs";
 
 /** kinds → ビット（notify_prefs.events と対応） */
 export const NOTIFY_EVENTS = Object.freeze({ needs_approval: 1, completed: 2, failed: 4 });
@@ -43,9 +43,18 @@ export function resolveNotifySettings(raw = {}, logger = null) {
   try {
     const file = String(raw.secretFile ?? "");
     if (!file) return off("BRIDGE_NOTIFY_SECRET_FILE is not set");
-    const stat = statSync(file);
-    if ((stat.mode & 0o777) !== 0o600) return off("the secret file must have mode 0600");
-    secret = readFileSync(file);
+    // One open, no symlink following, then one fstat on that same descriptor:
+    // no window between the mode check and the read, and a FIFO cannot block us.
+    const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const stat = fstatSync(fd);
+      if (!stat.isFile()) return off("the secret file must be a regular file");
+      if ((stat.mode & 0o777) !== 0o600) return off("the secret file must have mode 0600");
+      if (stat.size > 4096) return off("the secret file is too large");
+      secret = readFileSync(fd);
+    } finally {
+      closeSync(fd);
+    }
     if (secret.length < 16) return off("the secret file is too short");
   } catch {
     return off("the secret file is missing or unreadable");
@@ -66,6 +75,7 @@ export class NotifyStore {
 
   constructor(file) {
     this.#db = new DatabaseSync(file);
+    try { chmodSync(file, 0o600); } catch { /* the data directory is 0700 */ }
     this.#db.exec(`
       PRAGMA journal_mode = WAL;
       CREATE TABLE IF NOT EXISTS notify_prefs (
@@ -99,8 +109,25 @@ export class NotifyStore {
     return row ? { enabled: row.enabled === 1, events: Number(row.events) } : null;
   }
 
-  disableGrant(grantId) {
-    this.#db.prepare("UPDATE notify_prefs SET enabled = 0, updated_at = ? WHERE grant_id = ?").run(new Date().toISOString(), grantId);
+  listPrefs() {
+    return this.#db.prepare("SELECT grant_id, client_id, enabled, events, updated_at FROM notify_prefs ORDER BY grant_id, client_id").all()
+      .map((row) => ({ grantId: row.grant_id, clientId: row.client_id, enabled: row.enabled === 1, events: Number(row.events), updatedAt: row.updated_at }));
+  }
+
+  /** Enable or disable an existing row without touching its event bits. */
+  setEnabled(grantId, clientId, enabled) {
+    const result = this.#db.prepare("UPDATE notify_prefs SET enabled = ?, updated_at = ? WHERE grant_id = ? AND client_id = ?")
+      .run(enabled ? 1 : 0, new Date().toISOString(), grantId, clientId);
+    return Number(result.changes) > 0;
+  }
+
+  disableGrant(grantId, clientId = null) {
+    const now = new Date().toISOString();
+    if (clientId) {
+      this.#db.prepare("UPDATE notify_prefs SET enabled = 0, updated_at = ? WHERE grant_id = ? AND client_id = ?").run(now, grantId, clientId);
+      return;
+    }
+    this.#db.prepare("UPDATE notify_prefs SET enabled = 0, updated_at = ? WHERE grant_id = ?").run(now, grantId);
   }
 
   /** 同じ eventId を 1 回だけ通す。既に見ていれば false。 */
@@ -131,6 +158,9 @@ function sign(secret, timestamp, body) {
 
 /** ループバックの http 受信器（テスト用。許可フラグがあるときだけ使う） */
 function postLoopback(url, headers, body, timeoutMs) {
+  // The caller already restricted this to loopback; check again at the socket,
+  // so no other host can ever be reached through the plain-HTTP path.
+  if (!["127.0.0.1", "[::1]", "::1"].includes(url.hostname)) throw new Error("plain HTTP is only allowed to loopback");
   return new Promise((resolve, reject) => {
     const req = httpRequest({
       protocol: "http:",
@@ -214,52 +244,51 @@ export class Notifier {
 
   /**
    * @param {"needs_approval"|"completed"|"failed"} kind
-   * @param {{taskId: string, task: string, state: string, owner: {clientId: string, grantId: string}}} input
+   * @param {{taskId: string, task?: string|null, state: string, owner: {clientId: string, grantId: string}}} input
+   *   `task` must be a title the user set explicitly; a derived title or a
+   *   prompt excerpt stays out of the payload.
    */
   async notify(kind, input) {
-    if (!this.enabled) return { sent: false, reason: "off" };
+    if (!this.enabled) return { attempted: false, reason: "off" };
 
     const { owner } = input;
     const bit = NOTIFY_EVENTS[kind];
-    if (!bit || !owner?.grantId || !owner?.clientId) return { sent: false, reason: "no-owner" };
+    if (!bit || !owner?.grantId || !owner?.clientId) return { attempted: false, reason: "no-owner" };
 
     let store;
     try {
       store = this.#storeOrOpen();
     } catch (error) {
       this.#logger?.warn("Notification skipped: preference store unavailable", { error: String(error?.message ?? error) });
-      return { sent: false, reason: "store" };
+      return { attempted: false, reason: "store" };
     }
 
     if (!this.#grantActive(owner.grantId, owner.clientId)) {
-      try { store.disableGrant(owner.grantId); } catch { /* ignore */ }
-      return { sent: false, reason: "grant" };
+      try { store.disableGrant(owner.grantId, owner.clientId); } catch { /* ignore */ }
+      return { attempted: false, reason: "grant" };
     }
 
     const pref = store.pref(owner.grantId, owner.clientId);
-    if (!pref?.enabled || (pref.events & bit) === 0) return { sent: false, reason: "preference" };
+    if (!pref?.enabled || (pref.events & bit) === 0) return { attempted: false, reason: "preference" };
 
     const eventId = eventIdFor(owner.grantId, input.taskId ?? input.task, kind);
-    if (!store.claimEvent(eventId, this.#now())) return { sent: false, reason: "duplicate" };
-
     const now = this.#now();
+    const task = typeof input.task === "string" && input.task.trim() ? input.task.trim().slice(0, 200) : null;
+    const payload = { eventId, kind, ...(task ? { task } : {}), state: String(input.state ?? "").slice(0, 40), at: new Date(now).toISOString() };
+    const body = JSON.stringify(payload);
+
+    // Every refusal happens before the claim, so a suppressed or oversized
+    // notification leaves the event id free instead of burning it for 24 hours.
+    if (Buffer.byteLength(body) > MAX_PAYLOAD_BYTES) {
+      this.#logger?.warn("Notification skipped: payload too large", { kind, eventId });
+      return { attempted: false, reason: "payload" };
+    }
     if (!this.#underRate(owner.grantId, now)) {
       this.#suppressed += 1;
       this.#logger?.info("Notification suppressed by rate limit", { kind, grantId: owner.grantId, eventId, suppressedTotal: this.#suppressed });
-      return { sent: false, reason: "rate" };
+      return { attempted: false, reason: "rate" };
     }
-
-    const body = JSON.stringify({
-      eventId,
-      kind,
-      task: String(input.task ?? "").slice(0, 200),
-      state: String(input.state ?? "").slice(0, 40),
-      at: new Date(now).toISOString(),
-    });
-    if (Buffer.byteLength(body) > MAX_PAYLOAD_BYTES) {
-      this.#logger?.warn("Notification skipped: payload too large", { kind, eventId });
-      return { sent: false, reason: "payload" };
-    }
+    if (!store.claimEvent(eventId, now)) return { attempted: false, reason: "duplicate" };
 
     const timestamp = String(Math.floor(now / 1000));
     const headers = {
@@ -277,8 +306,9 @@ export class Notifier {
         timeoutMs: this.#settings.timeoutMs,
         allowLoopbackHttp: this.#settings.allowLoopbackHttp,
       });
-      this.#audit?.({ event: "notify", kind, eventId, host: this.#settings.host, status: res?.status ?? null, ok: res?.status >= 200 && res?.status < 300 });
-      return { sent: true, eventId, status: res?.status ?? null };
+      const delivered = Boolean(res?.status >= 200 && res?.status < 300);
+      this.#audit?.({ event: "notify", kind, eventId, host: this.#settings.host, status: res?.status ?? null, ok: delivered });
+      return { attempted: true, delivered, eventId, status: res?.status ?? null };
     } catch (error) {
       this.#logger?.warn("Notification delivery failed", {
         kind,
@@ -287,7 +317,20 @@ export class Notifier {
         error: String(error?.message ?? error).slice(0, 200),
       });
       this.#audit?.({ event: "notify", kind, eventId, host: this.#settings.host, ok: false });
-      return { sent: false, reason: "transport" };
+      return { attempted: true, delivered: false, eventId, reason: "transport" };
+    }
+  }
+
+  /**
+   * A revoked grant stops sending at once; the preference rows it left behind
+   * are disabled here instead of waiting for the next event. No-op while off.
+   */
+  disableGrant(grantId, clientId = null) {
+    if (!this.enabled || !grantId) return;
+    try {
+      this.#storeOrOpen().disableGrant(grantId, clientId);
+    } catch (error) {
+      this.#logger?.warn("Notification preference cleanup failed", { error: String(error?.message ?? error) });
     }
   }
 

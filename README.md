@@ -49,6 +49,18 @@ turns notifications off and the bridge keeps running.
 - `BRIDGE_NOTIFY_SECRET_FILE` (HMAC secret, mode `0600`)
 - Enable per user in the bridge database (`notify_prefs`); a grant and its client must both be enabled.
 
+Turn it on per grant from a terminal (the script opens the same `notify.db` and never
+reads the secret file):
+
+```sh
+node scripts/notify-prefs.mjs list
+node scripts/notify-prefs.mjs enable --grant <grantId> --client <clientId> --events needs_approval,completed
+node scripts/notify-prefs.mjs disable --grant <grantId> --client <clientId>
+```
+
+Add `--dry-run` to see what would change. Revoking a grant disables its rows at once.
+These rows only take effect while the bridge itself has notifications enabled.
+
 **The bridge cannot push into a ChatGPT conversation.** If you want to be told inside
 chat, ask for it: call `get_pending` (approvals and questions waiting) or `get_status`
 (running and recent tasks), or set up ChatGPT Tasks yourself to ask on a schedule.
@@ -57,6 +69,12 @@ untested here.
 
 Payloads are limited to 512 bytes, signed with HMAC-SHA256
 (`X-Bridge-Signature`, `X-Bridge-Timestamp`, `X-Bridge-Event`), de-duplicated for 24 hours,
-and rate limited (20/min per grant, 100/min overall). No message text, arguments,
-artifacts, paths, agent identifiers, or secrets are included.
+and rate limited (20/min per grant, 100/min overall). A payload carries the event id,
+the kind, the task state and the time. A task title is included **only when the caller
+typed one** (the `title` argument); a title derived from the message, the task text or a
+previous task is left out, and no message text, arguments, artifacts, paths, agent
+identifiers, or secrets are included.
+
+One webhook destination serves every grant on this bridge: it does not multiplex
+per-tenant endpoints, so run one bridge per tenant.
 

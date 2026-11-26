@@ -77,7 +77,7 @@ export class JobStore {
     return jobs.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))).slice(0, limit);
   }
 
-  async create({ agentId, kind, title, prompt, idempotencyKey = null, owner }) {
+  async create({ agentId, kind, title, titleFromUser = false, prompt, idempotencyKey = null, owner }) {
     if (!owner?.clientId || !owner.grantId) throw new Error("Authenticated grant required.");
     const now = new Date().toISOString();
     const job = {
@@ -87,6 +87,9 @@ export class JobStore {
       ownerGrantId: owner.grantId,
       agentId,
       title: title || prompt.slice(0, 80),
+      // Widget display may fall back to the prompt; notifications must not, so
+      // the origin of the title is recorded here and checked at the boundary.
+      titleFromUser: Boolean(title && titleFromUser),
       prompt,
       idempotencyKey,
       status: "created",
@@ -196,8 +199,16 @@ export class JobStore {
     const kind = status === "needs_person" ? "needs_approval" : status === "completed" ? "completed" : status === "failed" ? "failed" : null;
     if (!kind) return;
     const owner = { clientId: job.ownerClientId, grantId: job.ownerGrantId };
-    void this.#notify.notify(kind, { taskId: job.id, task: job.title ?? "task", state: status, owner })
-      .catch((error) => this.#logger?.warn("Notification hook failed", { error: String(error?.message ?? error) }));
+    // Only a title the user typed is sent. A prompt-derived or bridge-generated
+    // title is left out of the payload entirely (older jobs have no flag).
+    const task = job.titleFromUser === true ? job.title : null;
+    try {
+      void this.#notify.notify(kind, { taskId: job.id, task, state: status, owner })
+        .catch((error) => this.#logger?.warn("Notification hook failed", { error: String(error?.message ?? error) }));
+    } catch (error) {
+      // A notifier that throws synchronously must not fail the job either.
+      this.#logger?.warn("Notification hook failed", { error: String(error?.message ?? error) });
+    }
   }
 
   /** Waits up to `seconds` for the job to end. Kept short to fit MCP timeouts. */
