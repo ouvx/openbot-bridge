@@ -47,6 +47,17 @@ Streamable HTTP では Origin が付いたリクエストの送信元を検査�
 
 独立レビュー後、Main Bot へ計画を報告し、実施の合意を得てから行います。専用のデータ領域と試験宛先1体で、まず ChatGPT の読み取り接続・OAuth 更新を確認します。次に、管理者が許可したテストメッセージ1件で、承認前の送信ゼロ、カードとの照合、承認後の応答、再送時の実行件数と監査を確認します。試験終了時は試験用接続を閉じます。現在の証拠はローカル模擬環境です。公開判断には実クライアントの相互運用、OS の管理者境界、ログの保管期間・容量、失敗時の運用確認も残っています。
 
+## 公開前の走査
+
+`scripts/scan-secrets.py` は index と作業ツリーだけを対象にし、コミット履歴を走査しません。公開する前に、履歴の全コミット・全ブランチへ同じ観点の確認を行ってください。
+
+```sh
+git rev-list --all --count
+git log -p --all | grep -nE '/(home|Users)/|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[a-z]{2,}|ngrok|trycloudflare|BEGIN [A-Z ]*PRIVATE KEY'
+```
+
+過去に消した行も履歴には残ります。履歴の書き換えは公開後の取得側にも影響するため、公開前に判断してください。あわせて、`.gitignore` の対象外にある一時物(テスト用の `node_modules` symlink など)が残っていないことを `git status --porcelain -uall` で確認します。
+
 ## 配布の対象
 
 OpenBot Bridge は OpenAI の承認・提携を受けていない非公式プロジェクトです。ChatGPT App Directory への掲載は対象外です。

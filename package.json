@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": false,
   "license": "MIT",
-  "description": "An unofficial MCP server for connecting ChatGPT to a local OpenBot desktop app.",
+  "description": "An unofficial MCP server for a local OpenBot desktop app. Beta: the ChatGPT connector is not verified.",
   "type": "module",
   "engines": {
     "node": ">=22.5"
