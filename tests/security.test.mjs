@@ -6,7 +6,7 @@ import { assertPublicHttps, isPrivateAddress, EventBus } from "../src/events.mjs
 import { loadConfig } from "../src/config.mjs";
 
 test("maskSecrets hides credentials but keeps the rest readable", () => {
-  const masked = maskSecrets("token=super-secret-value and Bearer abcdefghijkl mnop sk-live-12345678");
+  const masked = maskSecrets("token=super-secret-value and Bearer abcdefghijkl mnop sk-test-12345678");
   assert.ok(!masked.includes("super-secret-value"));
   assert.ok(!masked.includes("abcdefghijkl"));
   assert.ok(masked.includes("mnop"));
