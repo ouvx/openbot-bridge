@@ -1,0 +1,27 @@
+# OpenBot Bridge
+
+ローカルの OpenBot を MCP クライアントから参照するための Node.js サーバーです。この配布候補は、認証済みのクライアントに接続確認と許可済みエージェント一覧を提供します。
+
+<!-- TODO: OpenBot・ChatGPT との関係を表す名称、非公式表記と配布条件を公開前に確定する。 -->
+
+## ローカルでの確認
+
+Node.js 24、npm、Git、Python 3 を使用します。Linux の OpenBot デスクトップと、その利用者が読める SQLite データベースが前提です。以下の初期化はこのプロジェクト内に専用の設定を作ります。
+
+```sh
+npm ci --ignore-scripts
+node scripts/setup.mjs
+npm test
+npm run doctor
+npm start
+```
+
+既定の待受はループバックのポート 8790、MCP のパスは `/mcp` です。稼働中のインスタンスと同じポートやデータディレクトリを使わずに確認してください。接続先のテストデータとポートの指定は[セットアップ手順](docs/INSTALL.md)を参照してください。
+
+## 公開前の確認
+
+```sh
+python3 scripts/scan-secrets.py
+```
+
+検査対象は Git の登録候補とステージ済みのスナップショットです。終了値 0 は定義したパターンに一致しなかったことを示します。新規の認証情報形式、自然文中の個人情報、利用権は別途確認してください。公開判断に関わる既知の制約は [SECURITY.md](SECURITY.md)、ライセンス候補は [LICENSE-CANDIDATES.md](LICENSE-CANDIDATES.md) にあります。

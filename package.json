@@ -1,0 +1,20 @@
+{
+  "name": "openbot-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OpenBot Bridge: a ChatGPT custom-plugin MCP server that connects ChatGPT to a running OpenBot desktop app.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "start": "node src/index.mjs",
+    "dev": "node --watch src/index.mjs",
+    "test": "node --test --test-concurrency=1 tests/*.test.mjs",
+    "doctor": "node scripts/doctor.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.24.0",
+    "zod": "^3.25.0"
+  }
+}
