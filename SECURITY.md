@@ -52,3 +52,22 @@ Streamable HTTP では Origin が付いたリクエストの送信元を検査�
 OpenBot Bridge は OpenAI の承認・提携を受けていない非公式プロジェクトです。ChatGPT App Directory への掲載は対象外です。
 
 このリポジトリの Bridge には MIT ライセンスを採用しています。OpenBot 本体は別ライセンスの PolyForm Noncommercial 1.0.0 で提供され、このリポジトリには同梱していません。
+
+## Notification webhook
+
+- Off by default. Any invalid configuration (missing URL, secret file not `0600`,
+  unknown mode) only disables notifications; the bridge keeps serving.
+- HTTPS only. Plain HTTP is accepted only for `127.0.0.1`/`[::1]` when
+  `BRIDGE_NOTIFY_ALLOW_LOOPBACK_HTTP=1` is set for tests.
+- The destination is resolved once and the connection is pinned to that address
+  (same rules as the existing callback transport); private addresses are refused
+  before any body is sent, and a changed DNS answer aborts the request.
+- Requests carry an HMAC-SHA256 signature over `<timestamp>.<body>` plus
+  `X-Bridge-Timestamp` (epoch seconds) so a receiver can reject anything older than
+  ±300 seconds. Secrets are read from a `0600` file, never logged, and never placed
+  in payloads, audit entries, or errors.
+- Delivery is fire-and-forget with a short timeout and no queue: a failed or refused
+  delivery never fails the bridge request that triggered it, and nothing is retried
+  after a restart.
+- Audit lines record only the outcome, kind, event id and destination host.
+

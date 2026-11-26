@@ -37,3 +37,26 @@ python3 scripts/scan-secrets.py
 ```
 
 検査対象は Git の登録候補とステージ済みのスナップショットです。終了値 0 は定義したパターンに一致しなかったことを示します。新規の認証情報形式、自然文中の個人情報、利用権は別途確認してください。公開判断に関わる既知の制約は [SECURITY.md](SECURITY.md)、ライセンスの採択記録は [LICENSE-CANDIDATES.md](LICENSE-CANDIDATES.md) にあります。
+
+## Notifications (optional)
+
+The bridge can send a signed webhook when a task needs a person, completes, or fails.
+It is **off by default** and fails closed: an unset, unknown, or invalid configuration
+turns notifications off and the bridge keeps running.
+
+- `BRIDGE_NOTIFY=off|webhook` (`session` is reserved and treated as `off`)
+- `BRIDGE_NOTIFY_WEBHOOK_URL` (HTTPS; plain HTTP only to loopback with an explicit test flag)
+- `BRIDGE_NOTIFY_SECRET_FILE` (HMAC secret, mode `0600`)
+- Enable per user in the bridge database (`notify_prefs`); a grant and its client must both be enabled.
+
+**The bridge cannot push into a ChatGPT conversation.** If you want to be told inside
+chat, ask for it: call `get_pending` (approvals and questions waiting) or `get_status`
+(running and recent tasks), or set up ChatGPT Tasks yourself to ask on a schedule.
+Combining the webhook with Slack or Gmail is possible in principle, but that setup is
+untested here.
+
+Payloads are limited to 512 bytes, signed with HMAC-SHA256
+(`X-Bridge-Signature`, `X-Bridge-Timestamp`, `X-Bridge-Event`), de-duplicated for 24 hours,
+and rate limited (20/min per grant, 100/min overall). No message text, arguments,
+artifacts, paths, agent identifiers, or secrets are included.
+
