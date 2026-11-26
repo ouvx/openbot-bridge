@@ -1,8 +1,9 @@
 {
   "name": "openbot-bridge",
   "version": "0.1.0",
-  "private": true,
-  "description": "OpenBot Bridge: a ChatGPT custom-plugin MCP server that connects ChatGPT to a running OpenBot desktop app.",
+  "private": false,
+  "license": "MIT",
+  "description": "An unofficial MCP server for connecting ChatGPT to a local OpenBot desktop app.",
   "type": "module",
   "engines": {
     "node": ">=22.5"

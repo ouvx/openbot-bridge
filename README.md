@@ -2,9 +2,15 @@
 
 ローカルの OpenBot を MCP クライアントから参照するための Node.js サーバーです。この配布候補は、認証済みのクライアントに接続確認と許可済みエージェント一覧を提供します。
 
-配布名・ライセンスは所有者の決定待ちです。
+本プロジェクトは非公式で、OpenAI の承認・提携を受けていません。ChatGPT App Directory への掲載は対象外です。
 
-<!-- TODO: OpenBot・ChatGPT との関係を表す名称、非公式表記と配布条件を公開前に確定する。 -->
+## ライセンス
+
+OpenBot Bridge には MIT ライセンスを採用しています。著作権者名は確定後に LICENSE の仮表記を差し替えます。[ライセンス全文](LICENSE)
+
+直接依存の `@modelcontextprotocol/sdk` と `zod` はいずれも MIT ライセンスです。
+
+OpenBot 本体は別ライセンスの PolyForm Noncommercial 1.0.0 で提供され、このリポジトリには同梱していません。
 
 ## ローカルでの確認
 
@@ -26,4 +32,4 @@ npm start
 python3 scripts/scan-secrets.py
 ```
 
-検査対象は Git の登録候補とステージ済みのスナップショットです。終了値 0 は定義したパターンに一致しなかったことを示します。新規の認証情報形式、自然文中の個人情報、利用権は別途確認してください。公開判断に関わる既知の制約は [SECURITY.md](SECURITY.md)、ライセンス候補は [LICENSE-CANDIDATES.md](LICENSE-CANDIDATES.md) にあります。
+検査対象は Git の登録候補とステージ済みのスナップショットです。終了値 0 は定義したパターンに一致しなかったことを示します。新規の認証情報形式、自然文中の個人情報、利用権は別途確認してください。公開判断に関わる既知の制約は [SECURITY.md](SECURITY.md)、ライセンスの採択記録は [LICENSE-CANDIDATES.md](LICENSE-CANDIDATES.md) にあります。
